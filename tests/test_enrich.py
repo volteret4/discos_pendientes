@@ -1,6 +1,53 @@
 import enrich
 
 
+# ── Regresión: quirks reales del JSON de Last.fm, encontrados en
+# producción al lanzar el backfill completo contra los 371 pendientes
+# reales (ver services/discos_pendientes/CLAUDE.md) ────────────────────
+
+def test_as_dict_handles_lastfm_empty_string_quirk():
+    # Last.fm devuelve "bio"/"tags"/"wiki": "" (string) en vez de {} para
+    # artistas/álbumes sin esos datos -- .get(x, {}) no protege porque la
+    # clave SÍ existe.
+    assert enrich._as_dict("") == {}
+    assert enrich._as_dict({"summary": "x"}) == {"summary": "x"}
+    assert enrich._as_dict(None) == {}
+
+
+def test_as_list_handles_lastfm_single_item_collapse():
+    # El XML->JSON de Last.fm colapsa listas de un elemento en un dict
+    # suelto: "tag": {...} con un tag, "tag": [{...}, {...}] con varios.
+    # Sin normalizar, [:6] sobre un dict revienta (KeyError: slice(...)).
+    assert enrich._as_list({"name": "idm"}) == [{"name": "idm"}]
+    assert enrich._as_list([{"name": "a"}, {"name": "b"}]) == [{"name": "a"}, {"name": "b"}]
+    assert enrich._as_list(None) == []
+    assert enrich._as_list("") == []
+
+
+def test_lfm_image_handles_empty_string_instead_of_list():
+    assert enrich._lfm_image("") == ""
+    assert enrich._lfm_image([]) == ""
+
+
+def test_enrich_album_survives_single_tag_and_empty_bio(patched_db, monkeypatch):
+    # Reproduce exactamente la forma real que rompía enrich_album() antes
+    # del fix: "tags" como dict suelto (un tag) y "bio"/"wiki" como "".
+    monkeypatch.setattr(enrich, "lfm_get", lambda method, params: (
+        {"artist": {"name": "Macroblank", "bio": "", "tags": {"tag": {"name": "downtempo"}}, "image": "", "url": "u"}}
+        if method == "artist.getInfo" else
+        {"album": {"name": "CLOWNS", "wiki": "", "tags": {"tag": {"name": "chillwave"}}, "image": "", "url": "u2"}}
+    ))
+    monkeypatch.setattr(enrich, "mb_search_release_group", lambda a, b: {})
+    monkeypatch.setattr(enrich, "mb_search_artist", lambda a: {})
+    monkeypatch.setattr(enrich, "wikipedia_summary", lambda a, lang="en": {})
+    monkeypatch.setattr(enrich.time, "sleep", lambda *_: None)
+
+    result = enrich.enrich_album("Macroblank", "CLOWNS")
+    assert result["source"] == "live"
+    assert result["artist"]["tags"] == ["downtempo"]
+    assert result["album"]["tags"] == ["chillwave"]
+
+
 def test_local_lookup_exact_match(patched_db):
     result = enrich.local_lookup("Boards of Canada", "Music Has the Right to Children")
     assert result is not None

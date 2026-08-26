@@ -22,7 +22,27 @@ _LFM_NO_IMG = "2a96cbd8b46e442fc41c2b86b821562f"
 _UA = "discos_pendientes/1.0 (https://github.com/volteret4/discos_pendientes)"
 
 
-def _lfm_image(images: list, size: str = "extralarge") -> str:
+def _as_dict(v) -> dict:
+    # Last.fm devuelve "" (string vacío) en vez de {} para "bio"/"tags"/
+    # "wiki" cuando no hay datos -- .get(x, {}) no protege de eso porque
+    # la clave SÍ existe (solo que con un valor "vacío" de otro tipo).
+    return v if isinstance(v, dict) else {}
+
+
+def _as_list(v) -> list:
+    # El XML->JSON de Last.fm colapsa listas de un solo elemento en un
+    # dict suelto en vez de [dict] (p.ej. "tag": {...} con un solo tag,
+    # "tag": [{...}, {...}] con varios) -- normaliza siempre a lista.
+    if isinstance(v, list):
+        return v
+    if isinstance(v, dict):
+        return [v]
+    return []
+
+
+def _lfm_image(images, size: str = "extralarge") -> str:
+    if not isinstance(images, list):
+        return ""  # Last.fm a veces devuelve "" en vez de [] cuando no hay imagen
     for img in images:
         url = img.get("#text", "")
         if img.get("size") == size and url and _LFM_NO_IMG not in url:
@@ -202,11 +222,11 @@ def enrich_album(artist: str, album: str) -> dict:
         ar = ar_data["artist"]
         result["artist"] = {
             "name": ar.get("name", artist),
-            "bio": (ar.get("bio", {}).get("summary", "") or "").split("<a ")[0].strip(),
-            "listeners": ar.get("stats", {}).get("listeners", ""),
+            "bio": (_as_dict(ar.get("bio")).get("summary", "") or "").split("<a ")[0].strip(),
+            "listeners": _as_dict(ar.get("stats")).get("listeners", ""),
             "image": _lfm_image(ar.get("image", [])),
             "url": ar.get("url", ""),
-            "tags": [t["name"] for t in (ar.get("tags", {}).get("tag", []) or [])[:6]],
+            "tags": [t["name"] for t in _as_list(_as_dict(ar.get("tags")).get("tag"))[:6]],
         }
     time.sleep(0.15 + random.random() * 0.15)
 
@@ -215,10 +235,10 @@ def enrich_album(artist: str, album: str) -> dict:
         al = al_data["album"]
         result["album"] = {
             "name": al.get("name", album),
-            "wiki": (al.get("wiki", {}).get("summary", "") or "").split("<a ")[0].strip(),
+            "wiki": (_as_dict(al.get("wiki")).get("summary", "") or "").split("<a ")[0].strip(),
             "image": _lfm_image(al.get("image", [])),
             "url": al.get("url", ""),
-            "tags": [t["name"] for t in (al.get("tags", {}).get("tag", []) or [])[:6]],
+            "tags": [t["name"] for t in _as_list(_as_dict(al.get("tags")).get("tag"))[:6]],
             "owned": False,
         }
     else:

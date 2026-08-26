@@ -1,0 +1,6 @@
+.git
+__pycache__
+*.pyc
+discos_pendientes.db
+.venv*
+tests

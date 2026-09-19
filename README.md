@@ -20,15 +20,18 @@ artista. Parte de [repeat-one](https://github.com/volteret4/repeat-one).
   un pendiente), Last.fm + Wikipedia + MusicBrainz en vivo, cacheado.
 - **Catálogo**: búsqueda/filtro por género, sello, año y artista sobre la
   tabla `albums` de `musica_local.sqlite` (la colección que ya se posee).
-- **Marcado en Radicale al descargar**: cuando `sync_downloaded_status()`
-  detecta que un pendiente pasa a estar descargado, busca el `VEVENT` de
-  su lanzamiento en `CALENDAR_NAME` (el calendario de lanzamientos, no el
-  de tareas) y le cambia el icono (💿/📀/🎵 → 💾) y añade la fecha de
-  descarga a su `DESCRIPTION`. No todos los pendientes tienen un
-  lanzamiento rastreado ahí — se omite en silencio si no hay VEVENT (ver
-  `CLAUDE.md`). No toca `STATUS` de ningún `VTODO` en `CALENDAR_TASKS`
+- **Marcado en Radicale al descargar**: `sync_release_calendar()` recorre
+  **todo** el calendario de lanzamientos ("discos", `RELEASE_CALENDAR_NAME`)
+  — no solo los álbumes que llegaron a ser tarea VTODO en la lista de
+  pendientes — y a cada `VEVENT` ya descargado (Airsonic/qBittorrent) le
+  cambia el icono (💿/📀/🎵 → 💾) y añade la fecha de descarga a su
+  `DESCRIPTION`. Un álbum puede descargarse sin haber pasado nunca por la
+  lista de pendientes (ej. comprado directamente al salir) y aun así se
+  marca. No toca `STATUS` de ningún `VTODO` en `CALENDAR_TASKS`
   (colisionaría con el uso que ya hace `dieta_sonora` de
-  `STATUS=COMPLETED` en ese calendario para marcar "escuchado").
+  `STATUS=COMPLETED` en ese calendario para marcar "escuchado"). Ver
+  `CLAUDE.md` para la tabla de los tres calendarios de Radicale
+  involucrados (fácil confundirlos por nombre parecido).
 
 ## Variables de entorno
 
@@ -58,10 +61,10 @@ PORT=5000
 
 ```bash
 pip install -r requirements.txt
-python3 sync.py --all      # backfill completo (tareas + descargas + enriquecimiento)
-python3 sync.py            # incremental (job diario en producción)
-python3 sync.py --backfill-icons --dry-run  # cuenta cuántos VEVENT se marcarían, sin escribir
-python3 sync.py --backfill-icons            # marca en Radicale lo ya descargado antes de esta feature (una vez)
+python3 sync.py --all      # backfill completo (tareas + descargas + enriquecimiento + calendario de lanzamientos)
+python3 sync.py            # incremental (job diario en producción, incluye sync_release_calendar)
+python3 sync.py --release-calendar --dry-run  # cuenta cuántos VEVENT del calendario "discos" se marcarían
+python3 sync.py --release-calendar            # fuerza una pasada completa del calendario "discos" (backfill histórico)
 python3 server.py          # web en 0.0.0.0:5000
 ```
 

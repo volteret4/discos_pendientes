@@ -2,14 +2,19 @@
 """Sincronización: refresca las tareas del calendario "discos pendientes",
 comprueba qué está descargado (Airsonic/qBittorrent) y precalienta el
 enriquecimiento en vivo (Last.fm/Wikipedia/MusicBrainz) para los que no
-están en la biblioteca local.
+están en la biblioteca local. También recorre el calendario de
+lanzamientos ("discos", ver radicale_writer.py) marcando en Radicale
+(icono + fecha) lo que ya esté descargado, esté o no en la lista de
+pendientes.
 
 Uso:
-    python3 sync.py --all      # backfill completo (ignora el caché de edad)
-    python3 sync.py            # incremental (solo lo que falta/está viejo)
+    python3 sync.py --all               # backfill completo (ignora el caché de edad)
+    python3 sync.py                     # incremental (solo lo que falta/está viejo)
+    python3 sync.py --release-calendar --dry-run  # cuenta cuántos del calendario de lanzamientos se marcarían
+    python3 sync.py --release-calendar  # fuerza una pasada completa del calendario de lanzamientos
 """
 import argparse
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import radicale_client
 import radicale_writer
@@ -56,9 +61,7 @@ def sync_downloaded_status(stale_only: bool = True) -> int:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=STALE_HOURS)).isoformat()
         rows = conn.execute(
             """
-            SELECT t.uid, t.artist, t.album, ps.downloaded AS prev_downloaded,
-                   ps.radicale_marked_at AS prev_marked
-            FROM tasks t
+            SELECT t.uid, t.artist, t.album FROM tasks t
             LEFT JOIN pending_status ps ON ps.uid = t.uid
             WHERE t.status = 'NEEDS-ACTION' AND (ps.uid IS NULL OR ps.checked_at < ?)
             """,
@@ -66,13 +69,7 @@ def sync_downloaded_status(stale_only: bool = True) -> int:
         ).fetchall()
     else:
         rows = conn.execute(
-            """
-            SELECT t.uid, t.artist, t.album, ps.downloaded AS prev_downloaded,
-                   ps.radicale_marked_at AS prev_marked
-            FROM tasks t
-            LEFT JOIN pending_status ps ON ps.uid = t.uid
-            WHERE t.status = 'NEEDS-ACTION'
-            """
+            "SELECT uid, artist, album FROM tasks WHERE status = 'NEEDS-ACTION'"
         ).fetchall()
 
     if not rows:
@@ -106,20 +103,6 @@ def sync_downloaded_status(stale_only: bool = True) -> int:
                 int(bool(qb_date)), qb_date.isoformat() if qb_date else None, downloaded, _now(),
             ),
         )
-
-        newly_downloaded = downloaded == 1 and r["prev_downloaded"] != 1
-        if newly_downloaded and not r["prev_marked"]:
-            try:
-                marked = radicale_writer.mark_downloaded(r["artist"], r["album"], date.today())
-            except Exception as e:
-                print(f"  aviso: no se pudo marcar en Radicale ({r['artist']} - {r['album']}): {e}")
-                marked = False
-            if marked:
-                conn.execute(
-                    "UPDATE pending_status SET radicale_marked_at = ? WHERE uid = ?",
-                    (_now(), r["uid"]),
-                )
-
         checked += 1
     conn.commit()
     conn.close()
@@ -161,68 +144,97 @@ def sync_all() -> None:
     sync_tasks()
     sync_downloaded_status(stale_only=False)
     sync_enrichment(stale_only=False)
+    sync_release_calendar(stale_only=False)
     print("Hecho.")
 
 
-def backfill_radicale_icons(dry_run: bool = False, limit: int | None = None) -> dict:
-    """Migración de datos histórica (correr a mano una vez, no en el cron
-    diario): para álbumes ya marcados como descargados antes de que
-    existiera radicale_writer.py, busca su VEVENT y le añade el icono +
-    fecha. Usa la fecha de descarga real (airsonic/qbittorrent), no
-    "hoy". No todas las tareas tienen un VEVENT de lanzamiento
-    correspondiente -- se cuentan aparte, no es un error."""
-    conn = get_conn()
-    query = (
-        "SELECT t.uid, t.artist, t.album, ps.airsonic_date, ps.qbittorrent_date "
-        "FROM pending_status ps JOIN tasks t ON t.uid = ps.uid "
-        "WHERE ps.downloaded = 1 AND ps.radicale_marked_at IS NULL"
-    )
-    if limit:
-        query += f" LIMIT {int(limit)}"
-    rows = conn.execute(query).fetchall()
+def sync_release_calendar(stale_only: bool = True, dry_run: bool = False) -> dict:
+    """Recorre TODO el calendario de lanzamientos ("discos", ver
+    radicale_writer.RELEASE_CALENDAR_NAME) -- no solo los álbumes que
+    llegaron a convertirse en tarea VTODO en CALENDAR_TASKS -- y marca en
+    Radicale (icono 💾 + fecha) los que ya estén descargados
+    (Airsonic/qBittorrent). Un álbum puede descargarse sin haber pasado
+    nunca por la lista de "discos_pendientes" (ej. se compró directamente
+    al salir), así que este chequeo es independiente de
+    sync_downloaded_status()/pending_status -- se apoya en su propia
+    tabla, release_marks, indexada por UID de VEVENT.
 
-    stats = {"total": len(rows), "marked": 0, "not_found": 0, "errors": 0}
-    print(f"backfill_icons: {len(rows)} candidatos{' (dry-run)' if dry_run else ''}...")
-
-    # Un solo REPORT del calendario completo, reutilizado para los N
-    # candidatos -- mark_downloaded() por defecto refetchea en cada
-    # llamada (correcto para el uso normal, uno a uno, desde
-    # sync_downloaded_status()), pero repetirlo cientos de veces aquí sería
-    # igual de lento que N sincronizaciones completas.
+    stale_only=True (uso diario): solo comprueba los VEVENT aún no
+    marcados cuyo último chequeo tiene más de STALE_HOURS, para no
+    repetir cientos de búsquedas en Airsonic cada día contra álbumes que
+    ya se comprobó que no estaban."""
     events = radicale_writer.fetch_release_events()
+    conn = get_conn()
+    known = {r["uid"]: r for r in conn.execute(
+        "SELECT uid, radicale_marked_at, checked_at FROM release_marks"
+    ).fetchall()}
 
-    for r in rows:
-        date_str = r["airsonic_date"] or r["qbittorrent_date"]
-        download_date = date.fromisoformat(date_str[:10]) if date_str else date.today()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=STALE_HOURS)).isoformat()
+    to_check = []
+    for e in events:
+        prev = known.get(e["uid"])
+        if prev and prev["radicale_marked_at"]:
+            continue  # ya marcado
+        if stale_only and prev and prev["checked_at"] >= cutoff:
+            continue  # comprobado hace poco, seguía sin descargar
+        to_check.append(e)
+
+    stats = {"total": len(to_check), "marked": 0, "still_pending": 0, "errors": 0}
+    if not to_check:
+        conn.close()
+        print("release_calendar: nada que comprobar")
+        return stats
+
+    print(f"release_calendar: comprobando {len(to_check)} lanzamientos{' (dry-run)' if dry_run else ''}...")
+    try:
+        torrents = get_torrents()
+    except Exception as e:
+        print(f"  aviso: no se pudo conectar a qBittorrent ({e}), se omite ese check")
+        torrents = []
+
+    for e in to_check:
         try:
-            if dry_run:
-                found = bool(next(
-                    (e for e in events
-                     if e["artist_norm"] == radicale_writer.normalize(r["artist"])
-                     and e["album_norm"] == radicale_writer.normalize(r["album"])),
-                    None,
-                ))
-            else:
-                found = radicale_writer.mark_downloaded(r["artist"], r["album"], download_date, events=events)
-        except Exception as e:
-            print(f"  error en {r['artist']} - {r['album']}: {e}")
+            airsonic_date = search_airsonic(e["artist"], e["album"])
+            qb_date = search_qbittorrent(torrents, e["artist"], e["album"]) if torrents else None
+        except Exception as ex:
+            print(f"  error comprobando {e['artist']} - {e['album']}: {ex}")
             stats["errors"] += 1
             continue
 
-        if found:
-            stats["marked"] += 1
-            if not dry_run:
-                conn.execute(
-                    "UPDATE pending_status SET radicale_marked_at = ? WHERE uid = ?",
-                    (_now(), r["uid"]),
-                )
+        download_date = airsonic_date or qb_date
+        now = _now()
+        radicale_marked_at = None
+        if download_date:
+            if dry_run:
+                stats["marked"] += 1
+            else:
+                try:
+                    ok = radicale_writer.mark_downloaded(e["artist"], e["album"], download_date, events=events)
+                except Exception as ex:
+                    print(f"  error marcando en Radicale {e['artist']} - {e['album']}: {ex}")
+                    ok = False
+                if ok:
+                    radicale_marked_at = now
+                    stats["marked"] += 1
         else:
-            stats["not_found"] += 1
+            stats["still_pending"] += 1
+
+        if not dry_run:
+            conn.execute(
+                """
+                INSERT INTO release_marks (uid, artist, album, downloaded, checked_at, radicale_marked_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(uid) DO UPDATE SET
+                    downloaded=excluded.downloaded, checked_at=excluded.checked_at,
+                    radicale_marked_at=COALESCE(release_marks.radicale_marked_at, excluded.radicale_marked_at)
+                """,
+                (e["uid"], e["artist"], e["album"], int(bool(download_date)), now, radicale_marked_at),
+            )
 
     if not dry_run:
         conn.commit()
     conn.close()
-    print(f"backfill_icons: {stats['marked']} marcados, {stats['not_found']} sin VEVENT, "
+    print(f"release_calendar: {stats['marked']} marcados, {stats['still_pending']} aún sin descargar, "
           f"{stats['errors']} errores (de {stats['total']})")
     return stats
 
@@ -230,17 +242,18 @@ def backfill_radicale_icons(dry_run: bool = False, limit: int | None = None) -> 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--all", action="store_true", help="backfill completo, ignora el caché de edad")
-    parser.add_argument("--backfill-icons", action="store_true",
-                         help="marca en Radicale los álbumes ya descargados antes de esta feature (correr una vez)")
-    parser.add_argument("--dry-run", action="store_true", help="con --backfill-icons: solo cuenta, no escribe")
-    parser.add_argument("--limit", type=int, default=None, help="con --backfill-icons: máximo de candidatos a procesar")
+    parser.add_argument("--release-calendar", action="store_true",
+                         help="fuerza una pasada completa (stale_only=False) del calendario de lanzamientos")
+    parser.add_argument("--dry-run", action="store_true",
+                         help="con --release-calendar: solo cuenta, no escribe en Radicale ni en la DB")
     args = parser.parse_args()
 
-    if args.backfill_icons:
-        backfill_radicale_icons(dry_run=args.dry_run, limit=args.limit)
+    if args.release_calendar:
+        sync_release_calendar(stale_only=False, dry_run=args.dry_run)
     elif args.all:
         sync_all()
     else:
         sync_tasks()
         sync_downloaded_status(stale_only=True)
         sync_enrichment(stale_only=True)
+        sync_release_calendar(stale_only=True)

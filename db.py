@@ -27,10 +27,19 @@ CREATE TABLE IF NOT EXISTS pending_status (
     qbittorrent_found INTEGER NOT NULL DEFAULT 0,
     qbittorrent_date  TEXT,
     downloaded        INTEGER NOT NULL DEFAULT 0,
-    checked_at        TEXT NOT NULL,
-    radicale_marked_at TEXT
+    checked_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pending_status_downloaded ON pending_status(downloaded);
+
+CREATE TABLE IF NOT EXISTS release_marks (
+    uid                TEXT PRIMARY KEY,
+    artist             TEXT NOT NULL,
+    album              TEXT NOT NULL,
+    downloaded         INTEGER NOT NULL DEFAULT 0,
+    checked_at         TEXT NOT NULL,
+    radicale_marked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_release_marks_marked ON release_marks(radicale_marked_at);
 
 CREATE TABLE IF NOT EXISTS enrichment (
     artist_norm    TEXT NOT NULL,
@@ -51,10 +60,13 @@ CREATE TABLE IF NOT EXISTS enrichment (
 def init_db(path: str = DB_PATH) -> None:
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
-    # CREATE TABLE IF NOT EXISTS no migra tablas ya existentes -- las DBs
-    # desplegadas antes de radicale_writer.py no tienen esta columna.
+    # Columna de una versión anterior de radicale_writer.py (marcado en
+    # pending_status, ligado a la lista de pendientes) -- superada por la
+    # tabla release_marks de arriba (marca sobre TODO el calendario de
+    # lanzamientos, no solo lo que llegó a ser tarea VTODO). DROP COLUMN
+    # falla en SQLite < 3.35 -- inofensivo dejarla huérfana en ese caso.
     try:
-        conn.execute("ALTER TABLE pending_status ADD COLUMN radicale_marked_at TEXT")
+        conn.execute("ALTER TABLE pending_status DROP COLUMN radicale_marked_at")
     except sqlite3.OperationalError:
         pass
     conn.commit()

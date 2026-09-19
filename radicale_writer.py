@@ -17,6 +17,7 @@ campo fuera de SUMMARY/DESCRIPTION del VEVENT que matchea.
 """
 import os
 from datetime import date
+from urllib.parse import urlsplit
 
 import requests
 from icalendar import Calendar
@@ -100,7 +101,13 @@ def mark_downloaded(artist: str, album: str, download_date: date) -> bool:
         comp["SUMMARY"] = _replace_icon(str(comp.get("SUMMARY", "")))
         comp["DESCRIPTION"] = _add_downloaded_line(str(comp.get("DESCRIPTION", "")), download_date)
 
-    url = f"{rc.RADICALE_URL}{match['href']}"
+    # rc.RADICALE_URL ya incluye el path base (ej. ".../pollo") y `href`
+    # (del REPORT) es ya una ruta absoluta desde la raíz del servidor que
+    # también empieza por ese mismo path -- concatenarlos tal cual duplica
+    # el prefijo (visto en producción: ".../pollo/pollo/..." -> 403).
+    # Solo hace falta el origin (scheme+host) de RADICALE_URL.
+    origin = urlsplit(rc.RADICALE_URL)
+    url = f"{origin.scheme}://{origin.netloc}{match['href']}"
     resp = requests.put(
         url,
         data=cal.to_ical(),

@@ -39,12 +39,16 @@ def test_add_downloaded_line_no_prior_description():
 def test_mark_downloaded_puts_modified_ical(monkeypatch):
     raw = _vevent_ical("💿 Boards of Canada - Geogaddi", description="Release Date for 💿 Boards of Canada - Geogaddi")
     monkeypatch.setattr(rw, "fetch_release_events", lambda: [{
-        "uid": "uid-rel-1", "href": "/cal/uid-rel-1.ics",
+        "uid": "uid-rel-1", "href": "/pollo/cal-uuid/uid-rel-1.ics",
         "artist": "Boards of Canada", "album": "Geogaddi",
         "artist_norm": "boards of canada", "album_norm": "geogaddi",
         "ical_text": raw,
     }])
-    monkeypatch.setattr(rw.rc, "RADICALE_URL", "https://radicale.example")
+    # RADICALE_URL incluye un path base (como en producción, ".../pollo")
+    # y el href devuelto por el REPORT ya es una ruta absoluta que también
+    # empieza por ese mismo path -- concatenarlos tal cual duplicaría el
+    # prefijo (bug real visto en producción: 403 por URL mal formada).
+    monkeypatch.setattr(rw.rc, "RADICALE_URL", "https://radicale.example/pollo")
     monkeypatch.setattr(rw.rc, "RADICALE_USER", "u")
     monkeypatch.setattr(rw.rc, "RADICALE_PW", "p")
 
@@ -63,7 +67,7 @@ def test_mark_downloaded_puts_modified_ical(monkeypatch):
     assert ok is True
     assert len(put_calls) == 1
     url, body = put_calls[0]
-    assert url == "https://radicale.example/cal/uid-rel-1.ics"
+    assert url == "https://radicale.example/pollo/cal-uuid/uid-rel-1.ics"
 
     cal = Calendar.from_ical(body)
     vevent = next(c for c in cal.walk() if c.name == "VEVENT")

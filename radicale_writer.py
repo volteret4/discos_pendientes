@@ -1,12 +1,19 @@
-"""Escritura en el calendario de lanzamientos de Radicale (CALENDAR_NAME):
-al detectar que un álbum pendiente se ha descargado, se marca el VEVENT
-de su lanzamiento con un icono de "descargado" y la fecha.
+"""Escritura en el calendario de lanzamientos de Radicale
+(RELEASE_CALENDAR_NAME): al detectar que un álbum pendiente se ha
+descargado, se marca el VEVENT de su lanzamiento con un icono de
+"descargado" y la fecha.
 
-CALENDAR_NAME es un calendario hermano de CALENDAR_TASKS (ver
+RELEASE_CALENDAR_NAME es un calendario hermano de CALENDAR_TASKS (ver
 radicale_client.py) -- comparte credenciales/URL/base, solo cambia el
-nombre del calendario. No toca STATUS de ningún VTODO en CALENDAR_TASKS
-(eso lo usa dieta_sonora/cal_to_estadisticas.py para "escuchado") ni
-ningún otro campo fuera de SUMMARY/DESCRIPTION del VEVENT que matchea.
+nombre del calendario. Es el mismo calendario que dieta_sonora conoce
+como CALENDAR_NAME -- aquí se usa un nombre de variable distinto a
+propósito: el `.env` raíz del monorepo ya reutiliza "CALENDAR_NAME" para
+un calendario *distinto* en otras secciones (colisión de nombres
+preexistente en el repo, no introducida aquí), así que pedir
+"CALENDAR_NAME" en PROFILE_VARS[discos_pendientes] resolvía al valor
+equivocado. No toca STATUS de ningún VTODO en CALENDAR_TASKS (eso lo usa
+dieta_sonora/cal_to_estadisticas.py para "escuchado") ni ningún otro
+campo fuera de SUMMARY/DESCRIPTION del VEVENT que matchea.
 """
 import os
 from datetime import date
@@ -17,7 +24,7 @@ from icalendar import Calendar
 import radicale_client as rc
 from normalize import normalize
 
-CALENDAR_NAME = os.environ.get("CALENDAR_NAME", "")
+RELEASE_CALENDAR_NAME = os.environ.get("RELEASE_CALENDAR_NAME", "")
 
 _ICON_DOWNLOADED = "💾"
 _DESCARGADO_PREFIX = "Descargado: "
@@ -32,7 +39,7 @@ def fetch_release_events() -> list[dict]:
     fetch_pending_tasks() con los VTODO.
     """
     events = []
-    for item in rc.fetch_calendar_items(CALENDAR_NAME):
+    for item in rc.fetch_calendar_items(RELEASE_CALENDAR_NAME):
         try:
             cal = Calendar.from_ical(item["ical_text"])
         except Exception:

@@ -6,8 +6,14 @@
   (`REPORT` + XML), sin el paquete `caldav`. Mismo patrón que
   `services/dieta_sonora/estadisticas/albums_log/{airsonic,qbittorrent}_checker.py`.
 - `radicale_writer.py` — **v2 sí escribe en Radicale**, pero solo
-  `SUMMARY`/`DESCRIPTION` de `VEVENT` en `CALENDAR_NAME` (el calendario
-  de lanzamientos, hermano de `CALENDAR_TASKS`), nunca `STATUS` de ningún
+  `SUMMARY`/`DESCRIPTION` de `VEVENT` en `RELEASE_CALENDAR_NAME` (el
+  calendario de lanzamientos, hermano de `CALENDAR_TASKS` -- el mismo
+  calendario que `dieta_sonora` conoce como `CALENDAR_NAME`; se usa un
+  nombre de variable distinto aquí porque el `.env` raíz del monorepo ya
+  reutiliza el nombre "CALENDAR_NAME" para un calendario *diferente* en
+  otras secciones -- colisión preexistente, no introducida por esta
+  feature, que causó que el primer despliegue resolviera al calendario
+  equivocado hasta renombrar la variable), nunca `STATUS` de ningún
   `VTODO` (ver más abajo por qué). Al detectar una descarga
   (`sync_downloaded_status()` en `sync.py`), busca el `VEVENT` del
   lanzamiento por `(artist_norm, album_norm)` y le cambia el icono

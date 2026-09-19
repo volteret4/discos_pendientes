@@ -183,19 +183,27 @@ def backfill_radicale_icons(dry_run: bool = False, limit: int | None = None) -> 
 
     stats = {"total": len(rows), "marked": 0, "not_found": 0, "errors": 0}
     print(f"backfill_icons: {len(rows)} candidatos{' (dry-run)' if dry_run else ''}...")
+
+    # Un solo REPORT del calendario completo, reutilizado para los N
+    # candidatos -- mark_downloaded() por defecto refetchea en cada
+    # llamada (correcto para el uso normal, uno a uno, desde
+    # sync_downloaded_status()), pero repetirlo cientos de veces aquí sería
+    # igual de lento que N sincronizaciones completas.
+    events = radicale_writer.fetch_release_events()
+
     for r in rows:
         date_str = r["airsonic_date"] or r["qbittorrent_date"]
         download_date = date.fromisoformat(date_str[:10]) if date_str else date.today()
         try:
             if dry_run:
                 found = bool(next(
-                    (e for e in radicale_writer.fetch_release_events()
+                    (e for e in events
                      if e["artist_norm"] == radicale_writer.normalize(r["artist"])
                      and e["album_norm"] == radicale_writer.normalize(r["album"])),
                     None,
                 ))
             else:
-                found = radicale_writer.mark_downloaded(r["artist"], r["album"], download_date)
+                found = radicale_writer.mark_downloaded(r["artist"], r["album"], download_date, events=events)
         except Exception as e:
             print(f"  error en {r['artist']} - {r['album']}: {e}")
             stats["errors"] += 1

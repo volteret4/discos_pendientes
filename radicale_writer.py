@@ -80,14 +80,20 @@ def _add_downloaded_line(description: str, download_date: date) -> str:
     return f"{description}\n{line}" if description else line
 
 
-def mark_downloaded(artist: str, album: str, download_date: date) -> bool:
+def mark_downloaded(artist: str, album: str, download_date: date, events: list[dict] | None = None) -> bool:
     """Busca el VEVENT de lanzamiento de (artist, album) y le añade el
     icono de descargado + la fecha. Devuelve False (no es un error) si
     no hay VEVENT correspondiente -- no todas las tareas pendientes
-    tienen un lanzamiento rastreado en el calendario."""
+    tienen un lanzamiento rastreado en el calendario.
+
+    `events` permite reutilizar un fetch_release_events() ya hecho (un
+    backfill sobre cientos de candidatos no debe repetir el REPORT del
+    calendario completo por cada uno -- ver sync.py::backfill_radicale_icons)."""
+    if events is None:
+        events = fetch_release_events()
     artist_norm, album_norm = normalize(artist), normalize(album)
     match = next(
-        (e for e in fetch_release_events()
+        (e for e in events
          if e["artist_norm"] == artist_norm and e["album_norm"] == album_norm),
         None,
     )

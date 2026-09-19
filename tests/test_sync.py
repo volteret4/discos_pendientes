@@ -35,6 +35,7 @@ def test_sync_downloaded_status_writes_pending_status(patched_db, monkeypatch):
     monkeypatch.setattr(sync, "get_torrents", lambda: [])
     monkeypatch.setattr(sync, "search_airsonic", lambda artist, album: date(2026, 2, 1))
     monkeypatch.setattr(sync, "search_qbittorrent", lambda torrents, artist, album: None)
+    monkeypatch.setattr(sync.radicale_writer, "mark_downloaded", lambda artist, album, d: False)
 
     n = sync.sync_downloaded_status(stale_only=False)
     assert n == 1
@@ -74,6 +75,49 @@ def test_sync_downloaded_status_stale_only_skips_fresh(patched_db, monkeypatch):
     n = sync.sync_downloaded_status(stale_only=True)
     assert n == 0
     assert calls["n"] == 0  # recién comprobado, no se vuelve a tocar
+
+
+def test_sync_downloaded_status_marks_radicale_on_new_download(patched_db, monkeypatch):
+    monkeypatch.setattr(sync.radicale_client, "fetch_pending_tasks", lambda: [
+        _fake_task("uid-1", "Boards of Canada", "Geogaddi"),
+    ])
+    sync.sync_tasks()
+
+    monkeypatch.setattr(sync, "get_torrents", lambda: [])
+    monkeypatch.setattr(sync, "search_airsonic", lambda artist, album: date(2026, 2, 1))
+    monkeypatch.setattr(sync, "search_qbittorrent", lambda torrents, artist, album: None)
+
+    calls = []
+    monkeypatch.setattr(sync.radicale_writer, "mark_downloaded", lambda artist, album, d: calls.append((artist, album, d)) or True)
+
+    sync.sync_downloaded_status(stale_only=False)
+    assert calls == [("Boards of Canada", "Geogaddi", date.today())]
+
+    conn = patched_db.get_conn()
+    row = conn.execute("SELECT radicale_marked_at FROM pending_status WHERE uid = 'uid-1'").fetchone()
+    conn.close()
+    assert row["radicale_marked_at"] is not None
+
+    # segunda pasada: sigue descargado y ya marcado -- no se vuelve a llamar
+    sync.sync_downloaded_status(stale_only=False)
+    assert len(calls) == 1
+
+
+def test_sync_downloaded_status_does_not_mark_when_still_not_downloaded(patched_db, monkeypatch):
+    monkeypatch.setattr(sync.radicale_client, "fetch_pending_tasks", lambda: [
+        _fake_task("uid-1", "Artista", "Album"),
+    ])
+    sync.sync_tasks()
+
+    monkeypatch.setattr(sync, "get_torrents", lambda: [])
+    monkeypatch.setattr(sync, "search_airsonic", lambda artist, album: None)
+    monkeypatch.setattr(sync, "search_qbittorrent", lambda torrents, artist, album: None)
+
+    calls = []
+    monkeypatch.setattr(sync.radicale_writer, "mark_downloaded", lambda artist, album, d: calls.append((artist, album, d)) or True)
+
+    sync.sync_downloaded_status(stale_only=False)
+    assert calls == []
 
 
 def test_sync_downloaded_status_stale_only_rechecks_old(patched_db, monkeypatch):

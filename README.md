@@ -20,10 +20,15 @@ artista. Parte de [repeat-one](https://github.com/volteret4/repeat-one).
   un pendiente), Last.fm + Wikipedia + MusicBrainz en vivo, cacheado.
 - **Catálogo**: búsqueda/filtro por género, sello, año y artista sobre la
   tabla `albums` de `musica_local.sqlite` (la colección que ya se posee).
-
-No escribe nada en Radicale (ver `CLAUDE.md` — colisionaría con el uso
-que ya hace `dieta_sonora` de `STATUS=COMPLETED` en el mismo calendario
-para marcar "escuchado").
+- **Marcado en Radicale al descargar**: cuando `sync_downloaded_status()`
+  detecta que un pendiente pasa a estar descargado, busca el `VEVENT` de
+  su lanzamiento en `CALENDAR_NAME` (el calendario de lanzamientos, no el
+  de tareas) y le cambia el icono (💿/📀/🎵 → 💾) y añade la fecha de
+  descarga a su `DESCRIPTION`. No todos los pendientes tienen un
+  lanzamiento rastreado ahí — se omite en silencio si no hay VEVENT (ver
+  `CLAUDE.md`). No toca `STATUS` de ningún `VTODO` en `CALENDAR_TASKS`
+  (colisionaría con el uso que ya hace `dieta_sonora` de
+  `STATUS=COMPLETED` en ese calendario para marcar "escuchado").
 
 ## Variables de entorno
 
@@ -33,6 +38,7 @@ RADICALE_USERNAME=...
 RADICALE_PW=...
 RADICALE_CALENDAR=            # vacío si los calendarios cuelgan directo de RADICALE_URL
 CALENDAR_TASKS=...            # UID del calendario de VTODOs "discos pendientes"
+CALENDAR_NAME=...             # UID del calendario de VEVENTs de lanzamientos (mismo que dieta_sonora)
 AIRSONIC_URL=...
 AIRSONIC_USER=...
 AIRSONIC_PASS=...
@@ -53,6 +59,8 @@ PORT=5000
 pip install -r requirements.txt
 python3 sync.py --all      # backfill completo (tareas + descargas + enriquecimiento)
 python3 sync.py            # incremental (job diario en producción)
+python3 sync.py --backfill-icons --dry-run  # cuenta cuántos VEVENT se marcarían, sin escribir
+python3 sync.py --backfill-icons            # marca en Radicale lo ya descargado antes de esta feature (una vez)
 python3 server.py          # web en 0.0.0.0:5000
 ```
 

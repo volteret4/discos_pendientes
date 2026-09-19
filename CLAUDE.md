@@ -5,7 +5,15 @@
 - `radicale_client.py` — lectura de VTODOs de Radicale por HTTP crudo
   (`REPORT` + XML), sin el paquete `caldav`. Mismo patrón que
   `services/dieta_sonora/estadisticas/albums_log/{airsonic,qbittorrent}_checker.py`.
-  **v1 no escribe nada en Radicale** (ver más abajo).
+- `radicale_writer.py` — **v2 sí escribe en Radicale**, pero solo
+  `SUMMARY`/`DESCRIPTION` de `VEVENT` en `CALENDAR_NAME` (el calendario
+  de lanzamientos, hermano de `CALENDAR_TASKS`), nunca `STATUS` de ningún
+  `VTODO` (ver más abajo por qué). Al detectar una descarga
+  (`sync_downloaded_status()` en `sync.py`), busca el `VEVENT` del
+  lanzamiento por `(artist_norm, album_norm)` y le cambia el icono
+  (💿/📀/🎵 → 💾) + añade `💾 Descargado: YYYY-MM-DD` a su `DESCRIPTION`.
+  PUT idempotente por `href` (sin `If-Match`/ETag — mismo patrón simple
+  que `services/bot_conciertos/apis/radicale.py::push_ics_event()`).
 - `airsonic_client.py` / `qbittorrent_client.py` — comprobación "¿ya
   descargado?", adaptados de los mismos checker scripts de arriba.
   `QB_HOST=host.docker.internal` (con `extra_hosts` en docker-compose) es
@@ -30,16 +38,45 @@
   Catálogo) y panel lateral flotante compartido, mismo patrón visual que
   el resto de servicios del monorepo.
 
-## Por qué v1 no escribe en Radicale
+## Por qué nunca se toca STATUS de VTODO
 
 `services/dieta_sonora/estadisticas/albums_log/cal_to_estadisticas.py` ya
-usa `VTODO STATUS=COMPLETED` en el mismo calendario (`CALENDAR_TASKS`) para
-marcar "escuchado" (vía scrobbles de Last.fm). Si este servicio también
-escribiera `STATUS=COMPLETED` para "ya descargado" pisaría esa semántica
-ya establecida. El estado "descargado" vive solo en `pending_status`
-(DB propia) — si en el futuro se quiere marcar algo en Radicale, habría
-que usar una propiedad custom (`X-DESCARGADO`, por ejemplo), nunca
-`STATUS`.
+usa `VTODO STATUS=COMPLETED` en `CALENDAR_TASKS` para marcar "escuchado"
+(vía scrobbles de Last.fm). Si este servicio también escribiera
+`STATUS=COMPLETED` para "ya descargado" pisaría esa semántica ya
+establecida. El estado "descargado" sigue viviendo en `pending_status`
+(DB propia, columna `radicale_marked_at` para no re-escribir el mismo
+VEVENT en cada sync) — lo único que se escribe en Radicale es
+`SUMMARY`/`DESCRIPTION` del `VEVENT` de lanzamiento en el *otro*
+calendario (`CALENDAR_NAME`), no el `VTODO`.
+
+## El icono de "descargado" (radicale_writer.py)
+
+No es un campo especial de iCal (no hay `CATEGORIES`/`COLOR` en uso en
+estos datos) — es un emoji literal al principio del `SUMMARY` del
+`VEVENT`, ej. `SUMMARY:💿 Cypress Hill - Dios Bendiga`. Ese convenio
+(💿 Album / 📀 EP / 🎵 Single, visto en
+`services/bot_conciertos/handlers/artist_handlers.py`) ya existía en los
+datos de producción antes de esta feature — el script original que creó
+esos VEVENT con icono no está en ningún repo conocido (no hace falta
+encontrarlo). `radicale_writer._replace_icon()` reutiliza
+`radicale_client._strip_emojis()` para quitar cualquier icono existente
+y anteponer `💾`, así que funciona igual haya o no un icono previo.
+
+**Solo el ~36% de los pendientes ya descargados tienen un VEVENT
+correspondiente** (cruzando por artista+álbum normalizado) — el resto
+son tareas sin lanzamiento rastreado en Muspy/`CALENDAR_NAME`.
+`mark_downloaded()` devuelve `False` en ese caso (no es un error, no se
+loguea como fallo).
+
+## Backfill (`sync.py --backfill-icons`)
+
+Migración de datos histórica para lo que ya estaba marcado como
+descargado antes de que existiera esta feature — no se ejecuta en el
+cron diario. Usa `--dry-run` primero para ver cuántos candidatos
+matchean sin escribir nada. Usa la fecha real de descarga
+(`airsonic_date`/`qbittorrent_date` ya guardadas en `pending_status`),
+no la fecha en que se corre el backfill.
 
 ## Los dos calendarios de Radicale
 

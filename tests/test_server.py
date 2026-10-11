@@ -1,3 +1,5 @@
+import os
+import sqlite3
 from datetime import date
 
 import pytest
@@ -100,6 +102,57 @@ def test_api_catalog_album_detail(client):
 def test_api_catalog_album_not_found(client):
     r = client.get("/api/catalog/album/999")
     assert r.status_code == 404
+
+
+def test_api_catalog_search_includes_first_listened(client):
+    sync.sync_album_first_listens()
+    r = client.get("/api/catalog/search")
+    data = r.get_json()
+    assert data["items"][0]["artist"] == "Boards of Canada"
+    assert data["items"][0]["first_listened"].startswith("2010-02")
+
+
+def test_api_catalog_artist_listens(client):
+    r = client.get("/api/catalog/artist_listens?artist=Boards of Canada")
+    data = r.get_json()
+    assert data["total_plays"] == 3
+    assert data["first_listened"].startswith("2010-02")
+    assert len(data["timeline"]) == 3
+
+
+def test_api_catalog_artist_listens_unknown(client):
+    r = client.get("/api/catalog/artist_listens?artist=Nadie Conocido")
+    data = r.get_json()
+    assert data["timeline"] == []
+    assert data["first_listened"] is None
+
+
+def test_api_catalog_artist_listens_missing_param(client):
+    r = client.get("/api/catalog/artist_listens")
+    assert r.status_code == 400
+
+
+def test_api_catalog_search_falls_back_to_artist_first_listened(client, patched_db):
+    # Mismo caso real reportado con Sigur Rós: un álbum sin ningún
+    # scrobble con tag exacto, pero cuyo artista sí tiene escuchas.
+    path = patched_db.MUSICA_LOCAL_DB
+    ro_dir = os.path.dirname(path)
+    os.chmod(ro_dir, 0o755)
+    os.chmod(path, 0o644)
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO albums (id, artist_id, name, year) VALUES (2, 1, 'Geogaddi (Reissue)', '2002')")
+    conn.commit()
+    conn.close()
+    os.chmod(path, 0o444)
+    os.chmod(ro_dir, 0o555)
+
+    sync.sync_album_first_listens()
+    sync.sync_artist_first_listens()
+
+    r = client.get("/api/catalog/search?album=Geogaddi")
+    item = r.get_json()["items"][0]
+    assert item["first_listened"] is None
+    assert item["artist_first_listened"].startswith("2010-02")
 
 
 def test_api_task_enrichment_local(client, monkeypatch):

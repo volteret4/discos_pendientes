@@ -198,3 +198,17 @@ def test_sync_release_calendar_dry_run_does_not_write(patched_db, monkeypatch):
     row = conn.execute("SELECT * FROM release_marks WHERE uid = 'uid-rel-4'").fetchone()
     conn.close()
     assert row is None  # dry-run: tampoco escribe en la DB
+
+
+def test_sync_album_first_listens_writes_and_is_idempotent(patched_db):
+    n1 = sync.sync_album_first_listens()
+    n2 = sync.sync_album_first_listens()  # segunda pasada, no debe duplicar filas
+
+    conn = patched_db.get_conn()
+    rows = conn.execute("SELECT * FROM album_first_listen").fetchall()
+    conn.close()
+
+    assert n1 == 1 and n2 == 1
+    assert len(rows) == 1
+    assert rows[0]["artist_norm"] == "boards of canada"
+    assert rows[0]["first_ts"] == 1265000000

@@ -52,6 +52,70 @@
 - `server.py` — Flask, una plantilla HTML con dos pestañas (Pendientes /
   Catálogo) y panel lateral flotante compartido, mismo patrón visual que
   el resto de servicios del monorepo.
+- `listens.py` — cruza `musica_local.sqlite` con los scrobbles de
+  Last.fm (`lastfm_stats.db`, esquema `artists`/`albums`/`scrobbles` ya
+  documentado en `services/discos_olvidados/staleness.py`) para sacar,
+  por álbum, su primera escucha (`compute_album_first_listens`,
+  `MIN(ts)`) y, por artista, su serie mensual de escuchas desde la
+  primera (`artist_timeline`, usada por el gráfico de la pestaña
+  Catálogo).
+
+## "Primera escucha" y gráfico de escuchas (pestaña Catálogo)
+
+La columna "Primera escucha" y el gráfico lineal al pulsar el nombre de
+la banda viven en dos sitios distintos a propósito:
+
+- **Columna "Primera escucha" (por álbum)**: se cachea en la tabla
+  propia `album_first_listen` (`artist_norm`/`album_norm` → `first_ts`),
+  recalculada entera en cada `sync.py` (`sync_album_first_listens()`,
+  sin staleness -- es un cruce SQLite→SQLite sin red, barato). Se cachea
+  porque `/api/catalog/search` ya lee de `musica_local.sqlite` (otra
+  conexión sqlite distinta) y cruzar ahí mismo con `lastfm_stats.db` fila
+  a fila en cada búsqueda sería lento; `_fetch_first_listens()` en
+  `server.py` hace el merge en Python para la página actual (no hay
+  `JOIN` SQL posible entre dos ficheros sqlite distintos sin `ATTACH`).
+  **Por eso esta columna no es ordenable** (`sort=`) -- vive en una base
+  de datos distinta a la que ordena el resto de columnas del catálogo.
+
+### Falso negativo real y frecuente (~42% de los álbumes) → fallback a nivel de artista
+
+El match de esta columna exige que algún scrobble tenga el **tag de
+álbum exacto** (`lastfm_stats.db` `albums.name`, normalizado) igual al
+nombre del álbum en `musica_local.sqlite`. En producción eso falla para
+el ~42% de los álbumes -- no por casos raros, sino por motivo muy
+corriente: reediciones/ediciones especiales con nombre distinto al tag
+real con el que se scrobbleó en su día, "..." vs "…" (visto en Sigur
+Rós: `Takk...` y `Takk…` son dos álbumes *distintos* dentro de
+`lastfm_stats.db`), recopilatorios, etc. Sin más, esos álbumes salían
+como "nunca escuchados" en la tabla aunque la banda sí tuviera scrobbles
+-- bug real reportado por el usuario con Sigur Rós (`ÁTTA`/`Ágætis
+byrjun`/`Valtari` sí machean por tag exacto, pero `Kveikur`, `22° Lunar
+Halo`, `( ) 20th Anniversary Edition`, `Odin's Raven Magic` y `Sigur Rós
+Presents Liminal Sleep` no, pese a que el artista tiene 61 scrobbles).
+
+A propósito **no se intenta arreglar con fuzzy matching** (mismo motivo
+ya documentado en `services/discos_olvidados/CLAUDE.md`: si hay muchos
+falsos positivos mejor revisarlo con el usuario antes de complicar el
+matching). En su lugar, `artist_first_listen` (tabla propia,
+`sync_artist_first_listens()`/`listens.compute_artist_first_listens()`)
+cachea la primera escucha **del artista en general** (cualquier
+scrobble, sin exigir álbum), y la UI la usa como fallback visualmente
+distinto: cuando no hay match exacto de álbum pero sí hay dato de
+artista, la celda muestra `~ fecha` en gris con un tooltip explicando
+que es aproximado (`renderFirstListened()` en `server.py`) -- así se
+distingue "nunca escuchado (de verdad)" de "escuchado, pero no bajo
+este tag de álbum exacto", en vez de dejarlo todo en blanco por igual.
+- **Gráfico de escuchas (por banda, `/api/catalog/artist_listens`)**: se
+  calcula en vivo contra `lastfm_stats.db` en cada clic (acción poco
+  frecuente, una sola query agregada por mes) -- no se cachea. Pulsar el
+  nombre del artista en la tabla del catálogo abre este gráfico en el
+  panel lateral en vez de filtrar por ese artista (ese filtro rápido
+  sigue existiendo para Sello/Género).
+
+Requiere montar el volumen `lastfm_data:ro` (el mismo que ya usan
+`discos_olvidados`/`lastfm_explorer`) con `LASTFM_DB=/data/lastfm_stats.db`
+-- ver `docker-compose.yml` del monorepo (`tumtumpa`), servicio
+`discos-pendientes`.
 
 ## Por qué nunca se toca STATUS de VTODO
 

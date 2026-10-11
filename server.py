@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import os
 import threading
+from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, render_template_string
 
 import sync
-from db import get_conn, get_musica_local_conn
+from db import get_conn, get_lastfm_conn, get_musica_local_conn
 from enrich import get_or_fetch_enrichment
+from listens import artist_timeline
+from normalize import normalize
 
 app = Flask(__name__)
 
@@ -160,6 +163,51 @@ CATALOG_BASE = """
 """
 
 
+def _fetch_first_listens(pairs):
+    """{(artist_norm, album_norm): iso_first_listened} para el conjunto de
+    pares de la página actual -- la caché vive en discos_pendientes.db
+    (album_first_listen), una conexión sqlite distinta de
+    musica_local.sqlite, así que no se puede hacer en un único JOIN SQL."""
+    pairs = list({p for p in pairs})
+    if not pairs:
+        return {}
+    conn = get_conn()
+    where = " OR ".join(["(artist_norm = ? AND album_norm = ?)"] * len(pairs))
+    params = [v for pair in pairs for v in pair]
+    rows = conn.execute(
+        f"SELECT artist_norm, album_norm, first_ts FROM album_first_listen WHERE {where}", params
+    ).fetchall()
+    conn.close()
+    return {
+        (r["artist_norm"], r["album_norm"]): datetime.fromtimestamp(r["first_ts"], tz=timezone.utc).isoformat()
+        for r in rows if r["first_ts"] is not None
+    }
+
+
+def _fetch_artist_first_listens(artist_norms):
+    """{artist_norm: iso_first_listened} -- fallback cuando
+    album_first_listen no tiene ningún scrobble con el tag de álbum
+    exacto (~42% de los álbumes en producción: reediciones, "..." vs
+    "…", recopilatorios... ver listens.compute_artist_first_listens).
+    Sin esto, esos álbumes aparecían como "nunca escuchados" aunque la
+    banda sí se hubiera escuchado -- lo que reportó el usuario con
+    Sigur Rós."""
+    artist_norms = list(set(artist_norms))
+    if not artist_norms:
+        return {}
+    conn = get_conn()
+    placeholders = ",".join(["?"] * len(artist_norms))
+    rows = conn.execute(
+        f"SELECT artist_norm, first_ts FROM artist_first_listen WHERE artist_norm IN ({placeholders})",
+        artist_norms,
+    ).fetchall()
+    conn.close()
+    return {
+        r["artist_norm"]: datetime.fromtimestamp(r["first_ts"], tz=timezone.utc).isoformat()
+        for r in rows if r["first_ts"] is not None
+    }
+
+
 @app.route("/api/catalog/search")
 def api_catalog_search():
     page = max(1, _int_or(request.args.get("page"), 1))
@@ -182,7 +230,29 @@ def api_catalog_search():
     ).fetchall()
     conn.close()
 
-    return jsonify({"total": total, "page": page, "per_page": per_page, "items": [dict(r) for r in rows]})
+    items = [dict(r) for r in rows]
+    first_listens = _fetch_first_listens((normalize(it["artist"]), normalize(it["album"])) for it in items)
+    artist_first_listens = _fetch_artist_first_listens(normalize(it["artist"]) for it in items)
+    for it in items:
+        it["first_listened"] = first_listens.get((normalize(it["artist"]), normalize(it["album"])))
+        it["artist_first_listened"] = artist_first_listens.get(normalize(it["artist"]))
+
+    return jsonify({"total": total, "page": page, "per_page": per_page, "items": items})
+
+
+@app.route("/api/catalog/artist_listens")
+def api_catalog_artist_listens():
+    artist = request.args.get("artist", "").strip()
+    if not artist:
+        return jsonify({"error": "falta artist"}), 400
+    conn = get_lastfm_conn()
+    try:
+        data = artist_timeline(conn, artist)
+    finally:
+        conn.close()
+    if data is None:
+        return jsonify({"artist": artist, "first_listened": None, "total_plays": 0, "timeline": []})
+    return jsonify({"artist": artist, **data})
 
 
 @app.route("/api/catalog/filters/meta")
@@ -318,6 +388,11 @@ tr:hover td { background: var(--surface-2); }
 .panel-link:hover { text-decoration: underline; }
 .panel-empty { color: var(--text-muted); font-size: 12px; }
 .owned-badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 4px; background: var(--surface-2); color: var(--accent); margin-top: 6px; }
+.chart-stats { display: flex; gap: 16px; margin-bottom: 10px; }
+.chart-stat { font-size: 11px; color: var(--text-muted); }
+.chart-stat strong { display: block; font-size: 15px; color: #fff; font-weight: 600; }
+.chart-tooltip-hint { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+.hint-approx { color: var(--text-muted); border-bottom: 1px dashed var(--text-muted); cursor: help; }
 </style>
 </head>
 <body>
@@ -376,6 +451,7 @@ tr:hover td { background: var(--surface-2); }
             <th class="sortable" data-sort="year">Año<span class="sort-arrow"></span></th>
             <th class="sortable" data-sort="label">Sello<span class="sort-arrow"></span></th>
             <th class="sortable" data-sort="genre">Género<span class="sort-arrow"></span></th>
+            <th title="No se puede ordenar por esta columna: vive en otra base de datos (Last.fm). Si no hay ningún scrobble con el tag de álbum exacto se muestra, en gris con '~', la primera escucha de la banda en general">Primera escucha</th>
         </tr></thead>
         <tbody id="catalog-results"></tbody>
     </table>
@@ -517,18 +593,25 @@ async function searchCatalog(page) {
     document.getElementById('summary-catalog').textContent = `${data.total} álbumes encontrados`;
     document.getElementById('catalog-results').innerHTML = data.items.map((it, i) => `
         <tr class="row-link" data-idx="${i}">
-            <td class="clickable" data-field="artist">${escapeHtml(it.artist)}</td>
+            <td class="clickable" data-field="artist" title="Ver escuchas a lo largo del tiempo">${escapeHtml(it.artist)}</td>
             <td>${escapeHtml(it.album)}</td>
             <td>${escapeHtml(it.year || '')}</td>
             <td class="clickable" data-field="label">${escapeHtml(it.label || '')}</td>
             <td class="clickable" data-field="genre">${escapeHtml(it.genre || '')}</td>
+            <td>${renderFirstListened(it)}</td>
         </tr>
     `).join('');
     document.querySelectorAll('#catalog-results tr').forEach((tr, i) => {
         const item = lastCatalog[i];
         tr.addEventListener('click', (evt) => {
-            if (evt.target.dataset.field) {
-                document.getElementById('f_' + (evt.target.dataset.field === 'artist' ? 'c_artist' : evt.target.dataset.field)).value = item[evt.target.dataset.field];
+            const field = evt.target.dataset.field;
+            if (field === 'artist') {
+                openArtistChart(item.artist);
+                evt.stopPropagation();
+                return;
+            }
+            if (field) {
+                document.getElementById('f_' + field).value = item[field];
                 searchCatalog(1);
                 evt.stopPropagation();
                 return;
@@ -539,6 +622,17 @@ async function searchCatalog(page) {
 
     renderCatalogSortIndicators();
     renderPagination('catalog-pagination', catalogPage, catalogTotalPages, searchCatalog);
+}
+
+function renderFirstListened(it) {
+    if (it.first_listened) {
+        return new Date(it.first_listened).toLocaleDateString('es-ES');
+    }
+    if (it.artist_first_listened) {
+        const d = new Date(it.artist_first_listened).toLocaleDateString('es-ES');
+        return `<span class="hint-approx" title="Ningún scrobble tiene el tag de álbum exacto (reediciones, recopilatorios...), pero la banda se escucha desde esta fecha">~ ${d}</span>`;
+    }
+    return '—';
 }
 
 // ── Paginación (compartida) ─────────────────────────────────────────────
@@ -590,6 +684,76 @@ function openCatalogPanel(item) {
 
 function closePanel() {
     document.getElementById('panel').classList.remove('open');
+}
+
+// ── Gráfico de escuchas por artista (banda) ────────────────────────────
+
+async function openArtistChart(artistName) {
+    const panel = document.getElementById('panel');
+    const body = document.getElementById('panel-body');
+    body.innerHTML = `
+        <div class="panel-title">${escapeHtml(artistName)}</div>
+        <div class="panel-sub">Escuchas a lo largo del tiempo</div>
+        <div id="panel-extra"><div class="panel-empty" style="margin-top:16px">Cargando…</div></div>
+    `;
+    panel.classList.add('open');
+    try {
+        const r = await fetch('/api/catalog/artist_listens?artist=' + encodeURIComponent(artistName));
+        const data = await r.json();
+        document.getElementById('panel-extra').innerHTML = renderArtistChart(data);
+    } catch {
+        document.getElementById('panel-extra').innerHTML = '<div class="panel-empty" style="margin-top:16px">No se pudo cargar el histórico de escuchas.</div>';
+    }
+}
+
+function renderArtistChart(data) {
+    if (!data.timeline || data.timeline.length === 0) {
+        return '<div class="panel-empty" style="margin-top:16px">Sin escuchas registradas en Last.fm para esta banda.</div>';
+    }
+    const firstDate = new Date(data.first_listened).toLocaleDateString('es-ES');
+    const peak = data.timeline.reduce((m, p) => p.plays > m.plays ? p : m, data.timeline[0]);
+    return panelSection('Escuchas (Last.fm)', `
+        <div class="chart-stats">
+            <div class="chart-stat">Primera escucha<strong>${escapeHtml(firstDate)}</strong></div>
+            <div class="chart-stat">Total scrobbles<strong>${data.total_plays.toLocaleString('es-ES')}</strong></div>
+            <div class="chart-stat">Mes con más escuchas<strong>${escapeHtml(peak.month)} (${peak.plays})</strong></div>
+        </div>
+        ${buildLineChartSvg(data.timeline)}
+        <div class="chart-tooltip-hint">Pasa el ratón por un punto para ver el mes y el nº de escuchas.</div>
+    `);
+}
+
+function buildLineChartSvg(points) {
+    const W = 330, H = 140, PAD_L = 8, PAD_R = 8, PAD_T = 14, PAD_B = 20;
+    const innerW = W - PAD_L - PAD_R, innerH = H - PAD_T - PAD_B;
+    const maxPlays = Math.max(...points.map(p => p.plays));
+    const stepX = points.length > 1 ? innerW / (points.length - 1) : 0;
+
+    const coords = points.map((p, i) => ({
+        x: PAD_L + i * stepX,
+        y: PAD_T + innerH - (maxPlays ? (p.plays / maxPlays) * innerH : 0),
+        ...p,
+    }));
+
+    const linePath = coords.map((c, i) => `${i === 0 ? 'M' : 'L'}${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(' ');
+    const areaPath = `${linePath} L${coords[coords.length - 1].x.toFixed(1)},${PAD_T + innerH} L${coords[0].x.toFixed(1)},${PAD_T + innerH} Z`;
+
+    const dots = coords.map(c => `
+        <circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="3" fill="var(--accent)">
+            <title>${escapeHtml(c.month)}: ${c.plays} escucha${c.plays === 1 ? '' : 's'}</title>
+        </circle>
+    `).join('');
+
+    return `
+        <svg width="100%" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" style="display:block">
+            <line x1="${PAD_L}" y1="${PAD_T + innerH}" x2="${W - PAD_R}" y2="${PAD_T + innerH}" stroke="var(--border)" stroke-width="1"/>
+            <path d="${areaPath}" fill="var(--accent)" fill-opacity="0.12" stroke="none"/>
+            <path d="${linePath}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            ${dots}
+            <text x="${PAD_L}" y="${H - 4}" font-size="10" fill="var(--text-muted)">${escapeHtml(points[0].month)}</text>
+            <text x="${W - PAD_R}" y="${H - 4}" font-size="10" fill="var(--text-muted)" text-anchor="end">${escapeHtml(points[points.length - 1].month)}</text>
+        </svg>
+    `;
 }
 
 function panelSection(title, html) {

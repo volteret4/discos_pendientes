@@ -5,7 +5,8 @@ enriquecimiento en vivo (Last.fm/Wikipedia/MusicBrainz) para los que no
 están en la biblioteca local. También recorre el calendario de
 lanzamientos ("discos", ver radicale_writer.py) marcando en Radicale
 (icono + fecha) lo que ya esté descargado, esté o no en la lista de
-pendientes.
+pendientes. Y cruza el catálogo local con los scrobbles de Last.fm para
+cachear la "primera escucha" de cada álbum (ver listens.py).
 
 Uso:
     python3 sync.py --all               # backfill completo (ignora el caché de edad)
@@ -19,8 +20,9 @@ from datetime import datetime, timedelta, timezone
 import radicale_client
 import radicale_writer
 from airsonic_client import search_airsonic
-from db import get_conn
+from db import get_conn, get_lastfm_conn, get_musica_local_conn
 from enrich import get_or_fetch_enrichment
+from listens import compute_album_first_listens, compute_artist_first_listens
 from qbittorrent_client import get_torrents, search_qbittorrent
 
 STALE_HOURS = 24
@@ -140,11 +142,76 @@ def sync_enrichment(stale_only: bool = True) -> int:
     return done
 
 
+def sync_album_first_listens() -> int:
+    """Recalcula por completo la caché de "primera escucha" por álbum
+    (album_first_listen), cruzando musica_local.sqlite con los scrobbles
+    de Last.fm. Cruce local SQLite->SQLite sin red -- a diferencia de
+    sync_downloaded_status()/sync_enrichment(), no hace falta staleness,
+    se recalcula entero en cada pasada (mismo patrón de recálculo
+    completo que discos_olvidados/staleness.py)."""
+    musica_conn = get_musica_local_conn()
+    lastfm_conn = get_lastfm_conn()
+    try:
+        rows = compute_album_first_listens(musica_conn, lastfm_conn)
+    finally:
+        musica_conn.close()
+        lastfm_conn.close()
+
+    conn = get_conn()
+    now = _now()
+    for r in rows:
+        conn.execute(
+            """
+            INSERT INTO album_first_listen (artist_norm, album_norm, first_ts, synced_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(artist_norm, album_norm) DO UPDATE SET
+                first_ts=excluded.first_ts, synced_at=excluded.synced_at
+            """,
+            (r["artist_norm"], r["album_norm"], r["first_ts"], now),
+        )
+    conn.commit()
+    conn.close()
+    print(f"album_first_listens: {len(rows)} álbumes procesados")
+    return len(rows)
+
+
+def sync_artist_first_listens() -> int:
+    """Fallback de sync_album_first_listens() a nivel de artista -- ver
+    listens.compute_artist_first_listens(). Mismo patrón de recálculo
+    completo sin staleness (cruce local SQLite->SQLite, sin red)."""
+    musica_conn = get_musica_local_conn()
+    lastfm_conn = get_lastfm_conn()
+    try:
+        rows = compute_artist_first_listens(musica_conn, lastfm_conn)
+    finally:
+        musica_conn.close()
+        lastfm_conn.close()
+
+    conn = get_conn()
+    now = _now()
+    for r in rows:
+        conn.execute(
+            """
+            INSERT INTO artist_first_listen (artist_norm, first_ts, synced_at)
+            VALUES (?,?,?)
+            ON CONFLICT(artist_norm) DO UPDATE SET
+                first_ts=excluded.first_ts, synced_at=excluded.synced_at
+            """,
+            (r["artist_norm"], r["first_ts"], now),
+        )
+    conn.commit()
+    conn.close()
+    print(f"artist_first_listens: {len(rows)} artistas procesados")
+    return len(rows)
+
+
 def sync_all() -> None:
     sync_tasks()
     sync_downloaded_status(stale_only=False)
     sync_enrichment(stale_only=False)
     sync_release_calendar(stale_only=False)
+    sync_album_first_listens()
+    sync_artist_first_listens()
     print("Hecho.")
 
 
@@ -257,3 +324,5 @@ if __name__ == "__main__":
         sync_downloaded_status(stale_only=True)
         sync_enrichment(stale_only=True)
         sync_release_calendar(stale_only=True)
+        sync_album_first_listens()
+        sync_artist_first_listens()

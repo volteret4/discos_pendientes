@@ -3,6 +3,7 @@ import sqlite3
 
 DB_PATH = os.environ.get("DB_PATH", "/app/discos_pendientes.db")
 MUSICA_LOCAL_DB = os.environ.get("MUSICA_LOCAL_DB", "/musica_local.sqlite")
+LASTFM_DB = os.environ.get("LASTFM_DB", "/data/lastfm_stats.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -54,6 +55,29 @@ CREATE TABLE IF NOT EXISTS enrichment (
     fetched_at     TEXT NOT NULL,
     PRIMARY KEY (artist_norm, album_norm)
 );
+
+-- Caché de "primera escucha" por álbum, cruzado contra los scrobbles de
+-- Last.fm (lastfm_stats.db, ver listens.py/sync.sync_album_first_listens).
+-- Recalculado por completo en cada sync (cruce local SQLite->SQLite, sin
+-- red -- no hace falta staleness aquí, a diferencia de pending_status).
+CREATE TABLE IF NOT EXISTS album_first_listen (
+    artist_norm TEXT NOT NULL,
+    album_norm  TEXT NOT NULL,
+    first_ts    INTEGER,
+    synced_at   TEXT NOT NULL,
+    PRIMARY KEY (artist_norm, album_norm)
+);
+
+-- Primera escucha por ARTISTA (no por álbum concreto) -- fallback para
+-- cuando album_first_listen.first_ts es NULL porque ningún scrobble
+-- tiene el tag de álbum exacto (ver listens.compute_artist_first_listens
+-- y CLAUDE.md -- falso negativo real y frecuente, ~42% de los álbumes
+-- en producción, no un caso raro).
+CREATE TABLE IF NOT EXISTS artist_first_listen (
+    artist_norm TEXT PRIMARY KEY,
+    first_ts    INTEGER,
+    synced_at   TEXT NOT NULL
+);
 """
 
 
@@ -90,5 +114,13 @@ def get_musica_local_conn() -> sqlite3.Connection:
     # encontrado y documentado en services/lastfm_explorer/db.py y
     # services/yt_playlists/db.py).
     conn = sqlite3.connect(f"file:{MUSICA_LOCAL_DB}?mode=ro&immutable=1", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_lastfm_conn() -> sqlite3.Connection:
+    # Mismo volumen "lastfm_data" :ro que ya usa discos_olvidados/db.py --
+    # immutable=1 por el mismo motivo de bind-mount de solo lectura.
+    conn = sqlite3.connect(f"file:{LASTFM_DB}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
     return conn

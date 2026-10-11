@@ -64,7 +64,37 @@ def own_db_path(tmp_path):
 
 
 @pytest.fixture
-def patched_db(monkeypatch, musica_local_path, own_db_path):
+def lastfm_path(tmp_path):
+    # Mismo esquema (artists/albums/scrobbles) ya documentado y usado por
+    # services/discos_olvidados/staleness.py contra lastfm_stats.db real.
+    ro_dir = tmp_path / "lastfm_ro"
+    ro_dir.mkdir()
+    path = ro_dir / "lastfm_stats.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE artists (artist_id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE albums (artist_id INTEGER, album_id INTEGER, name TEXT);
+        CREATE TABLE scrobbles (artist_id INTEGER, album_id INTEGER, ts INTEGER);
+        """
+    )
+    # Boards of Canada, "Music Has the Right to Children": primer scrobble
+    # en 2010-02-01, luego más escuchas repartidas en el tiempo.
+    conn.execute("INSERT INTO artists (artist_id, name) VALUES (1, 'Boards of Canada')")
+    conn.execute("INSERT INTO albums (artist_id, album_id, name) VALUES (1, 10, 'Music Has the Right to Children')")
+    for ts in (1265000000, 1270000000, 1300000000):  # 2010-02, 2010-03, 2011-03
+        conn.execute("INSERT INTO scrobbles (artist_id, album_id, ts) VALUES (1, 10, ?)", (ts,))
+    conn.commit()
+    conn.close()
+    os.chmod(path, 0o444)
+    os.chmod(ro_dir, 0o555)
+    yield str(path)
+    os.chmod(ro_dir, 0o755)
+
+
+@pytest.fixture
+def patched_db(monkeypatch, musica_local_path, own_db_path, lastfm_path):
     monkeypatch.setattr(db_module, "MUSICA_LOCAL_DB", musica_local_path)
     monkeypatch.setattr(db_module, "DB_PATH", own_db_path)
+    monkeypatch.setattr(db_module, "LASTFM_DB", lastfm_path)
     return db_module

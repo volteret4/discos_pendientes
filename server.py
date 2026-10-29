@@ -454,6 +454,8 @@ HTML_PAGE = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Discos Pendientes</title>
+<!-- Iconos Airsonic / qBittorrent / escuchado / Mix (servicio ya-lo-tengo) -->
+<script>(function(){var s=document.createElement('script');s.src=location.protocol+'//'+location.hostname+':8780/owned-badges.js';document.head.appendChild(s);})();</script>
 <style>
 :root {
     --bg: #0a0e27; --surface: #16213e; --surface-2: #1f2d4a; --border: #2d3e5f;
@@ -640,6 +642,10 @@ function escapeHtml(s) {
     return d.innerHTML;
 }
 
+function escapeAttr(s) {
+    return escapeHtml(s).replace(/"/g, '&quot;');
+}
+
 function switchTab(tab) {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tab));
@@ -699,7 +705,7 @@ async function searchTasks(page) {
     document.getElementById('tasks-results').innerHTML = data.items.map((it, i) => `
         <tr class="row-link" data-idx="${i}">
             <td>${escapeHtml(it.artist)}</td>
-            <td>${escapeHtml(it.album)}</td>
+            <td data-owned-artist="${escapeAttr(it.artist)}" data-owned-album="${escapeAttr(it.album)}">${escapeHtml(it.album)}</td>
             <td>${it.dtstart ? new Date(it.dtstart).toLocaleDateString('es-ES') : ''}</td>
             <td><span class="mark ${it.downloaded ? 'yes' : 'no'}">${it.downloaded ? '✓' : '✗'}</span></td>
         </tr>
@@ -790,7 +796,7 @@ async function searchCatalog(page) {
     document.getElementById('catalog-results').innerHTML = data.items.map((it, i) => `
         <tr class="row-link" data-idx="${i}">
             <td class="clickable" data-field="artist" title="Ver escuchas a lo largo del tiempo">${escapeHtml(it.artist)}</td>
-            <td>${escapeHtml(it.album)}</td>
+            <td data-owned-artist="${escapeAttr(it.artist)}" data-owned-album="${escapeAttr(it.album)}">${escapeHtml(it.album)}</td>
             <td>${escapeHtml(it.year || '')}</td>
             <td class="clickable" data-field="label">${escapeHtml(it.label || '')}</td>
             <td class="clickable" data-field="genre">${escapeHtml(it.genre || '')}</td>
@@ -891,7 +897,7 @@ async function searchArtists(page) {
     document.getElementById('summary-artists').textContent = `${data.total} artistas encontrados`;
     document.getElementById('artists-results').innerHTML = data.items.map(it => `
         <tr>
-            <td class="clickable" data-value="${escapeHtml(it.artist)}" title="Ver escuchas a lo largo del tiempo">${escapeHtml(it.artist)}</td>
+            <td class="clickable" data-value="${escapeAttr(it.artist)}" data-owned-artist="${escapeAttr(it.artist)}" title="Ver escuchas a lo largo del tiempo">${escapeHtml(it.artist)}</td>
             <td>${it.album_count}</td>
             <td>${it.backed_up_count} / ${it.album_count}</td>
             <td>${formatDaysSince(it.days_since)}</td>

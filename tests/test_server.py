@@ -120,6 +120,22 @@ def test_api_catalog_staleness_refresh(client):
     assert client.get("/api/catalog/staleness/status").get_json()["computed_at"] == data["computed_at"]
 
 
+def test_api_tasks_sort(client):
+    r = client.get("/api/tasks?status=all&sort=artist&dir=asc").get_json()
+    names = [it["artist"] for it in r["items"]]
+    assert names == sorted(names, key=str.lower)
+    r = client.get("/api/tasks?status=all&sort=artist&dir=desc").get_json()
+    assert [it["artist"] for it in r["items"]] == sorted(names, key=str.lower, reverse=True)
+    assert client.get("/api/tasks?status=all&sort=bogus").status_code == 200
+
+
+def test_api_catalog_search_sort_by_first_listened(client):
+    sync.sync_album_first_listens()
+    data = client.get("/api/catalog/search?sort=first_listened&dir=asc").get_json()
+    assert data["total"] == 1
+    assert data["items"][0]["first_listened"].startswith("2010-02")
+
+
 def test_api_catalog_filters_meta(client):
     r = client.get("/api/catalog/filters/meta")
     data = r.get_json()

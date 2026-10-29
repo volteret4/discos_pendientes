@@ -31,6 +31,14 @@ def health():
 
 # ── Pendientes ───────────────────────────────────────────────────────────
 
+TASKS_SORT_COLUMNS = {
+    "artist": "t.artist COLLATE NOCASE",
+    "album": "t.album COLLATE NOCASE",
+    "dtstart": "t.dtstart",
+    "downloaded": "COALESCE(ps.downloaded, 0)",
+}
+
+
 @app.route("/api/tasks")
 def api_tasks():
     page = max(1, _int_or(request.args.get("page"), 1))
@@ -53,6 +61,8 @@ def api_tasks():
         where.append("t.artist LIKE ?")
         params.append(f"%{artist}%")
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    sort_col = TASKS_SORT_COLUMNS.get(request.args.get("sort"), TASKS_SORT_COLUMNS["dtstart"])
+    sort_dir = "ASC" if request.args.get("dir") == "asc" else "DESC"
 
     base = """
         FROM tasks t
@@ -66,7 +76,7 @@ def api_tasks():
                ps.downloaded, ps.airsonic_date, ps.qbittorrent_date, ps.checked_at
         {base}
         {where_sql}
-        ORDER BY t.dtstart DESC
+        ORDER BY {sort_col} {sort_dir}, t.dtstart DESC
         LIMIT ? OFFSET ?
         """,
         [*params, per_page, (page - 1) * per_page],
@@ -213,6 +223,35 @@ def _fetch_artist_first_listens(artist_norms):
 # ver staleness.py) -- filtrar u ordenar por ellas obliga a hacerlo en
 # Python sobre todas las filas que cumplen el WHERE, no en SQL.
 STALENESS_SORT_KEYS = {"days_since", "in_qbittorrent"}
+IN_MEMORY_SORT_KEYS = STALENESS_SORT_KEYS | {"first_listened"}
+
+
+def _annotate_all_first_listens(items):
+    """Igual que _fetch_first_listens/_fetch_artist_first_listens pero
+    cargando las dos tablas enteras de una vez (para ordenar todo el
+    catálogo por primera escucha; por página bastan las otras)."""
+    def iso(ts):
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts is not None else None
+    conn = get_conn()
+    albums = {(r["artist_norm"], r["album_norm"]): iso(r["first_ts"])
+              for r in conn.execute("SELECT artist_norm, album_norm, first_ts FROM album_first_listen")}
+    artists = {r["artist_norm"]: iso(r["first_ts"])
+               for r in conn.execute("SELECT artist_norm, first_ts FROM artist_first_listen")}
+    conn.close()
+    for it in items:
+        an = normalize(it["artist"])
+        it["first_listened"] = albums.get((an, normalize(it["album"])))
+        it["artist_first_listened"] = artists.get(an)
+    return items
+
+
+def _sort_first_listened(rows, desc):
+    """Por la primera escucha del álbum o, si no hay, la de la banda (lo
+    mismo que muestra la columna con "~"); sin ninguna, siempre al final."""
+    def eff(r):
+        return r.get("first_listened") or r.get("artist_first_listened")
+    known = sorted((r for r in rows if eff(r)), key=eff, reverse=desc)
+    return known + [r for r in rows if not eff(r)]
 
 
 def _annotate_staleness(items):
@@ -258,7 +297,7 @@ def api_catalog_search():
     sort_key = request.args.get("sort")
     sort_col = CATALOG_SORT_COLUMNS.get(sort_key, CATALOG_SORT_COLUMNS["artist"])
     sort_dir = "DESC" if request.args.get("dir") == "desc" else "ASC"
-    in_memory = (sort_key in STALENESS_SORT_KEYS
+    in_memory = (sort_key in IN_MEMORY_SORT_KEYS
                  or request.args.get("never_listened") in ("yes", "no")
                  or request.args.get("qbittorrent") in ("yes", "no"))
 
@@ -266,7 +305,9 @@ def api_catalog_search():
     select = f"SELECT al.id, al.name AS album, al.year, al.label, al.genre, ar.name AS artist {CATALOG_BASE} {where_sql}"
     if in_memory:
         all_rows = _filter_staleness(_annotate_staleness([dict(r) for r in conn.execute(select, params)]), request.args)
-        if sort_key in STALENESS_SORT_KEYS:
+        if sort_key == "first_listened":
+            all_rows = _sort_first_listened(_annotate_all_first_listens(all_rows), sort_dir == "DESC")
+        elif sort_key in STALENESS_SORT_KEYS:
             all_rows.sort(key=_staleness_sort_key(sort_key), reverse=(sort_dir == "DESC"))
         else:
             all_rows.sort(key=_staleness_sort_key(sort_key if sort_key in CATALOG_SORT_COLUMNS else "artist"),
@@ -511,7 +552,10 @@ tr:hover td { background: var(--surface-2); }
     <div id="summary"></div>
     <table>
         <thead><tr>
-            <th>Artista</th><th>Álbum</th><th>Fecha</th><th>Descargado</th>
+            <th class="sortable" data-sort="artist">Artista<span class="sort-arrow"></span></th>
+            <th class="sortable" data-sort="album">Álbum<span class="sort-arrow"></span></th>
+            <th class="sortable" data-sort="dtstart">Fecha<span class="sort-arrow"></span></th>
+            <th class="sortable" data-sort="downloaded">Descargado<span class="sort-arrow"></span></th>
         </tr></thead>
         <tbody id="tasks-results"></tbody>
     </table>
@@ -549,7 +593,7 @@ tr:hover td { background: var(--surface-2); }
             <th class="sortable" data-sort="year">Año<span class="sort-arrow"></span></th>
             <th class="sortable" data-sort="label">Sello<span class="sort-arrow"></span></th>
             <th class="sortable" data-sort="genre">Género<span class="sort-arrow"></span></th>
-            <th title="No se puede ordenar por esta columna: vive en otra base de datos (Last.fm). Si no hay ningún scrobble con el tag de álbum exacto se muestra, en gris con '~', la primera escucha de la banda en general">Primera escucha</th>
+            <th class="sortable" data-sort="first_listened" title="Primera escucha en Last.fm. Si no hay ningún scrobble con el tag de álbum exacto se muestra, en gris con '~', la primera escucha de la banda en general">Primera escucha<span class="sort-arrow"></span></th>
             <th class="sortable" data-sort="days_since" title="Tiempo desde la última escucha del álbum en Last.fm / ListenBrainz">Sin escuchar<span class="sort-arrow"></span></th>
             <th class="sortable" data-sort="in_qbittorrent" title="Está en el backup de qBittorrent (trasvase, colección 2)">qBittorrent<span class="sort-arrow"></span></th>
         </tr></thead>
@@ -623,12 +667,25 @@ function clearTaskFilters() {
     searchTasks(1);
 }
 
+let tasksSortKey = 'dtstart', tasksSortDir = 'desc';
+
+document.querySelectorAll('#tab-pendientes th.sortable').forEach(th => {
+    th.addEventListener('click', () => {
+        const key = th.dataset.sort;
+        if (tasksSortKey === key) tasksSortDir = tasksSortDir === 'asc' ? 'desc' : 'asc';
+        else { tasksSortKey = key; tasksSortDir = (key === 'dtstart' || key === 'downloaded') ? 'desc' : 'asc'; }
+        searchTasks(1);
+    });
+});
+
 async function searchTasks(page) {
     tasksPage = page;
     const params = new URLSearchParams({
         status: document.getElementById('f_status').value,
         downloaded: document.getElementById('f_downloaded').value,
         page: page,
+        sort: tasksSortKey,
+        dir: tasksSortDir,
     });
     const artist = document.getElementById('f_p_artist').value.trim();
     if (artist) params.set('artist', artist);
@@ -651,6 +708,9 @@ async function searchTasks(page) {
         tr.addEventListener('click', () => openTaskPanel(lastTasks[parseInt(tr.dataset.idx)]));
     });
 
+    document.querySelectorAll('#tab-pendientes th.sortable').forEach(th => {
+        th.querySelector('.sort-arrow').textContent = th.dataset.sort === tasksSortKey ? (tasksSortDir === 'asc' ? '▲' : '▼') : '';
+    });
     renderPagination('tasks-pagination', tasksPage, tasksTotalPages, searchTasks);
 }
 

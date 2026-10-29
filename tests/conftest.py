@@ -93,8 +93,37 @@ def lastfm_path(tmp_path):
 
 
 @pytest.fixture
-def patched_db(monkeypatch, musica_local_path, own_db_path, lastfm_path):
+def trasvase_path(tmp_path):
+    # music.db de services/trasvase: collection=2 = backup de qBittorrent
+    # (ver staleness._load_qbittorrent_index).
+    ro_dir = tmp_path / "trasvase_ro"
+    ro_dir.mkdir()
+    path = ro_dir / "music.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE albums (id INTEGER PRIMARY KEY, artist_id INTEGER, title TEXT, collection INTEGER);
+        """
+    )
+    conn.execute("INSERT INTO artists (id, name) VALUES (1, 'Boards of Canada')")
+    conn.execute("INSERT INTO albums (artist_id, title, collection) VALUES (1, 'Music Has the Right to Children', 2)")
+    conn.commit()
+    conn.close()
+    os.chmod(path, 0o444)
+    os.chmod(ro_dir, 0o555)
+    yield str(path)
+    os.chmod(ro_dir, 0o755)
+
+
+@pytest.fixture
+def patched_db(monkeypatch, musica_local_path, own_db_path, lastfm_path, trasvase_path):
+    import staleness
     monkeypatch.setattr(db_module, "MUSICA_LOCAL_DB", musica_local_path)
     monkeypatch.setattr(db_module, "DB_PATH", own_db_path)
     monkeypatch.setattr(db_module, "LASTFM_DB", lastfm_path)
+    monkeypatch.setattr(db_module, "TRASVASE_DB", trasvase_path)
+    # Caché de proceso: cada test parte de cero con sus propias BDs
+    monkeypatch.setattr(staleness, "_CACHE",
+                        {"albums": None, "artists": None, "album_index": None, "computed_at": None})
     return db_module

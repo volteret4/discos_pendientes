@@ -85,6 +85,41 @@ def test_api_catalog_search_by_genre(client):
     assert r.get_json()["total"] == 0
 
 
+def test_api_catalog_search_includes_staleness(client):
+    it = client.get("/api/catalog/search").get_json()["items"][0]
+    assert it["in_qbittorrent"] is True
+    assert it["days_since"] is not None and it["days_since"] > 365
+
+
+def test_api_catalog_search_staleness_filters(client):
+    assert client.get("/api/catalog/search?qbittorrent=yes").get_json()["total"] == 1
+    assert client.get("/api/catalog/search?qbittorrent=no").get_json()["total"] == 0
+    assert client.get("/api/catalog/search?never_listened=yes").get_json()["total"] == 0
+    assert client.get("/api/catalog/search?never_listened=no&genre=IDM").get_json()["total"] == 1
+    assert client.get("/api/catalog/search?never_listened=no&genre=NoExiste").get_json()["total"] == 0
+
+
+def test_api_catalog_search_sort_by_days_since(client):
+    data = client.get("/api/catalog/search?sort=days_since&dir=desc").get_json()
+    assert data["total"] == 1
+    assert data["items"][0]["artist"] == "Boards of Canada"
+
+
+def test_api_catalog_artists(client):
+    data = client.get("/api/catalog/artists").get_json()
+    assert data["total"] == 1
+    a = data["items"][0]
+    assert a["artist"] == "Boards of Canada"
+    assert a["album_count"] == 1 and a["backed_up_count"] == 1
+    assert client.get("/api/catalog/artists?never_listened=yes").get_json()["total"] == 0
+
+
+def test_api_catalog_staleness_refresh(client):
+    data = client.post("/api/catalog/staleness/refresh").get_json()
+    assert data["ok"] and data["computed_at"]
+    assert client.get("/api/catalog/staleness/status").get_json()["computed_at"] == data["computed_at"]
+
+
 def test_api_catalog_filters_meta(client):
     r = client.get("/api/catalog/filters/meta")
     data = r.get_json()

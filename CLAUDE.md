@@ -40,6 +40,14 @@
   desde el `SUMMARY` del VTODO, así que es más simple). Solo se cachea en
   la tabla `enrichment` el camino "live" — el camino "local_db" es
   instantáneo y se recalcula siempre.
+- `staleness.py` — copiado de `services/discos_olvidados` (retirado; su
+  web se fusionó aquí). Cruza `musica_local.sqlite` con `lastfm_stats.db`
+  (última escucha por álbum/artista) y con `music.db` de `trasvase`
+  (`collection=2` = backup de qBittorrent), en caché de proceso
+  (`POST /api/catalog/staleness/refresh` lo recalcula). Alimenta las
+  columnas "Sin escuchar"/"qBittorrent" del Catálogo y la pestaña
+  Artistas. Filtrar u ordenar por esas columnas pasa el catálogo a modo
+  en memoria (no se puede en SQL: viven en otras BDs).
 - `db.py` — `discos_pendientes.db` propia (`tasks`/`pending_status`/
   `release_marks`/`enrichment`) + conexión de solo lectura a
   `musica_local.sqlite` con `immutable=1` en la URI (mismo problema de

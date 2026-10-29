@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, render_template_string
 
+import staleness
 import sync
 from db import get_conn, get_lastfm_conn, get_musica_local_conn
 from enrich import get_or_fetch_enrichment
@@ -208,29 +209,79 @@ def _fetch_artist_first_listens(artist_norms):
     }
 
 
+# Columnas que viven fuera de musica_local.sqlite (Last.fm / trasvase,
+# ver staleness.py) -- filtrar u ordenar por ellas obliga a hacerlo en
+# Python sobre todas las filas que cumplen el WHERE, no en SQL.
+STALENESS_SORT_KEYS = {"days_since", "in_qbittorrent"}
+
+
+def _annotate_staleness(items):
+    index = staleness.album_index()
+    for it in items:
+        st = index.get((normalize(it["artist"]), normalize(it["album"])))
+        it["days_since"] = st["days_since"] if st else None
+        it["last_listened"] = st["last_listened"] if st else None
+        it["in_qbittorrent"] = bool(st and st["in_qbittorrent"])
+    return items
+
+
+def _staleness_sort_key(sort_key):
+    """Mismo criterio que discos_olvidados: "nunca escuchado" (None) cuenta
+    como infinito, así sale el primero ordenando de más a menos días."""
+    def key(r):
+        v = r.get(sort_key)
+        if v is None:
+            return float("inf") if sort_key == "days_since" else ""
+        return v.lower() if isinstance(v, str) else v
+    return key
+
+
+def _filter_staleness(rows, args):
+    never = args.get("never_listened")
+    qbittorrent = args.get("qbittorrent")
+    if never == "yes":
+        rows = [r for r in rows if r["days_since"] is None]
+    elif never == "no":
+        rows = [r for r in rows if r["days_since"] is not None]
+    if qbittorrent == "yes":
+        rows = [r for r in rows if r.get("in_qbittorrent")]
+    elif qbittorrent == "no":
+        rows = [r for r in rows if not r.get("in_qbittorrent")]
+    return rows
+
+
 @app.route("/api/catalog/search")
 def api_catalog_search():
     page = max(1, _int_or(request.args.get("page"), 1))
     per_page = min(200, max(1, _int_or(request.args.get("per_page"), PER_PAGE)))
     where_sql, params = _build_catalog_where(request.args)
-    sort_col = CATALOG_SORT_COLUMNS.get(request.args.get("sort"), CATALOG_SORT_COLUMNS["artist"])
+    sort_key = request.args.get("sort")
+    sort_col = CATALOG_SORT_COLUMNS.get(sort_key, CATALOG_SORT_COLUMNS["artist"])
     sort_dir = "DESC" if request.args.get("dir") == "desc" else "ASC"
+    in_memory = (sort_key in STALENESS_SORT_KEYS
+                 or request.args.get("never_listened") in ("yes", "no")
+                 or request.args.get("qbittorrent") in ("yes", "no"))
 
     conn = get_musica_local_conn()
-    total = conn.execute(f"SELECT COUNT(*) {CATALOG_BASE} {where_sql}", params).fetchone()[0]
-    rows = conn.execute(
-        f"""
-        SELECT al.id, al.name AS album, al.year, al.label, al.genre, ar.name AS artist
-        {CATALOG_BASE}
-        {where_sql}
-        ORDER BY {sort_col} {sort_dir}
-        LIMIT ? OFFSET ?
-        """,
-        [*params, per_page, (page - 1) * per_page],
-    ).fetchall()
+    select = f"SELECT al.id, al.name AS album, al.year, al.label, al.genre, ar.name AS artist {CATALOG_BASE} {where_sql}"
+    if in_memory:
+        all_rows = _filter_staleness(_annotate_staleness([dict(r) for r in conn.execute(select, params)]), request.args)
+        if sort_key in STALENESS_SORT_KEYS:
+            all_rows.sort(key=_staleness_sort_key(sort_key), reverse=(sort_dir == "DESC"))
+        else:
+            all_rows.sort(key=_staleness_sort_key(sort_key if sort_key in CATALOG_SORT_COLUMNS else "artist"),
+                          reverse=(sort_dir == "DESC"))
+        total = len(all_rows)
+        items = all_rows[(page - 1) * per_page: page * per_page]
+    else:
+        total = conn.execute(f"SELECT COUNT(*) {CATALOG_BASE} {where_sql}", params).fetchone()[0]
+        rows = conn.execute(
+            f"{select} ORDER BY {sort_col} {sort_dir} LIMIT ? OFFSET ?",
+            [*params, per_page, (page - 1) * per_page],
+        ).fetchall()
+        items = _annotate_staleness([dict(r) for r in rows])
     conn.close()
 
-    items = [dict(r) for r in rows]
     first_listens = _fetch_first_listens((normalize(it["artist"]), normalize(it["album"])) for it in items)
     artist_first_listens = _fetch_artist_first_listens(normalize(it["artist"]) for it in items)
     for it in items:
@@ -238,6 +289,39 @@ def api_catalog_search():
         it["artist_first_listened"] = artist_first_listens.get(normalize(it["artist"]))
 
     return jsonify({"total": total, "page": page, "per_page": per_page, "items": items})
+
+
+@app.route("/api/catalog/artists")
+def api_catalog_artists():
+    """Pestaña Artistas (antes en discos_olvidados): última escucha por
+    artista y cuántos de sus álbumes están en el backup de qBittorrent."""
+    rows = staleness.get_report("artists")
+    artist = (request.args.get("artist") or "").strip().lower()
+    if artist:
+        rows = [r for r in rows if artist in (r.get("artist") or "").lower()]
+    rows = _filter_staleness(rows, {"never_listened": request.args.get("never_listened")})
+
+    sort_key = request.args.get("sort") or "days_since"
+    if sort_key not in {"artist", "album_count", "backed_up_count", "days_since"}:
+        sort_key = "days_since"
+    sort_dir = request.args.get("dir") or ("desc" if sort_key == "days_since" else "asc")
+    rows = sorted(rows, key=_staleness_sort_key(sort_key), reverse=(sort_dir == "desc"))
+
+    page = max(1, _int_or(request.args.get("page"), 1))
+    per_page = min(200, max(1, _int_or(request.args.get("per_page"), PER_PAGE)))
+    return jsonify({"total": len(rows), "page": page, "per_page": per_page,
+                    "items": rows[(page - 1) * per_page: page * per_page]})
+
+
+@app.route("/api/catalog/staleness/refresh", methods=["POST"])
+def api_catalog_staleness_refresh():
+    staleness.refresh_all()
+    return jsonify({"ok": True, "computed_at": staleness.computed_at()})
+
+
+@app.route("/api/catalog/staleness/status")
+def api_catalog_staleness_status():
+    return jsonify({"computed_at": staleness.computed_at()})
 
 
 @app.route("/api/catalog/artist_listens")
@@ -392,6 +476,11 @@ tr:hover td { background: var(--surface-2); }
 .chart-stat { font-size: 11px; color: var(--text-muted); }
 .chart-stat strong { display: block; font-size: 15px; color: #fff; font-weight: 600; }
 .chart-tooltip-hint { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+.icon-yes { color: var(--accent); font-weight: 700; }
+.icon-no { color: var(--danger); font-weight: 700; }
+.never { color: var(--danger); font-weight: 600; }
+.stale-high { color: var(--warning); }
+.staleness-status { color: var(--text-muted); font-size: 12px; align-self: center; }
 .hint-approx { color: var(--text-muted); border-bottom: 1px dashed var(--text-muted); cursor: help; }
 </style>
 </head>
@@ -400,6 +489,7 @@ tr:hover td { background: var(--surface-2); }
 <div class="tabs">
     <button class="tab-btn active" data-tab="pendientes" onclick="switchTab('pendientes')">Pendientes</button>
     <button class="tab-btn" data-tab="catalogo" onclick="switchTab('catalogo')">Catálogo</button>
+    <button class="tab-btn" data-tab="artistas" onclick="switchTab('artistas')">Artistas</button>
 </div>
 
 <div id="tab-pendientes" class="tab-panel active">
@@ -436,11 +526,19 @@ tr:hover td { background: var(--surface-2); }
         <div><label>Sello</label><input type="text" id="f_label" list="labels_list"></div>
         <div><label>Año desde</label><input type="number" id="f_year_from" placeholder="1990"></div>
         <div><label>Año hasta</label><input type="number" id="f_year_to" placeholder="2026"></div>
+        <div><label>Escuchado</label>
+            <select id="f_never"><option value="">Todos</option><option value="yes">Nunca</option><option value="no">Alguna vez</option></select>
+        </div>
+        <div><label>En qBittorrent</label>
+            <select id="f_qbittorrent"><option value="">Todos</option><option value="yes">Sí</option><option value="no">No</option></select>
+        </div>
         <datalist id="genres_list"></datalist>
         <datalist id="labels_list"></datalist>
         <div class="actions">
             <button onclick="searchCatalog(1)">Buscar</button>
             <button class="secondary" onclick="clearCatalogFilters()">Limpiar</button>
+            <button class="secondary" onclick="refreshStaleness()" title="Vuelve a cruzar la colección con Last.fm y con el backup de qBittorrent (trasvase)">Recalcular escuchas y descargas</button>
+            <span class="staleness-status"></span>
         </div>
     </div>
     <div id="summary-catalog"></div>
@@ -452,10 +550,38 @@ tr:hover td { background: var(--surface-2); }
             <th class="sortable" data-sort="label">Sello<span class="sort-arrow"></span></th>
             <th class="sortable" data-sort="genre">Género<span class="sort-arrow"></span></th>
             <th title="No se puede ordenar por esta columna: vive en otra base de datos (Last.fm). Si no hay ningún scrobble con el tag de álbum exacto se muestra, en gris con '~', la primera escucha de la banda en general">Primera escucha</th>
+            <th class="sortable" data-sort="days_since" title="Tiempo desde la última escucha del álbum en Last.fm / ListenBrainz">Sin escuchar<span class="sort-arrow"></span></th>
+            <th class="sortable" data-sort="in_qbittorrent" title="Está en el backup de qBittorrent (trasvase, colección 2)">qBittorrent<span class="sort-arrow"></span></th>
         </tr></thead>
         <tbody id="catalog-results"></tbody>
     </table>
     <div class="pagination" id="catalog-pagination"></div>
+</div>
+
+<div id="tab-artistas" class="tab-panel">
+    <div class="filters">
+        <div><label>Artista</label><input type="text" id="fr_artist"></div>
+        <div><label>Escuchado</label>
+            <select id="fr_never"><option value="">Todos</option><option value="yes">Nunca</option><option value="no">Alguna vez</option></select>
+        </div>
+        <div class="actions">
+            <button onclick="searchArtists(1)">Buscar</button>
+            <button class="secondary" onclick="clearArtistFilters()">Limpiar</button>
+            <button class="secondary" onclick="refreshStaleness()">Recalcular escuchas y descargas</button>
+            <span class="staleness-status"></span>
+        </div>
+    </div>
+    <div id="summary-artists"></div>
+    <table>
+        <thead><tr>
+            <th class="sortable" data-sort="artist">Artista<span class="sort-arrow"></span></th>
+            <th class="sortable" data-sort="album_count">Álbumes<span class="sort-arrow"></span></th>
+            <th class="sortable" data-sort="backed_up_count">En qBittorrent<span class="sort-arrow"></span></th>
+            <th class="sortable" data-sort="days_since">Sin escuchar<span class="sort-arrow"></span></th>
+        </tr></thead>
+        <tbody id="artists-results"></tbody>
+    </table>
+    <div class="pagination" id="artists-pagination"></div>
 </div>
 
 <div id="panel">
@@ -476,7 +602,13 @@ function switchTab(tab) {
     if (tab === 'catalogo' && !window._catalogLoaded) {
         window._catalogLoaded = true;
         loadCatalogMeta();
+        loadStalenessStatus();
         searchCatalog(1);
+    }
+    if (tab === 'artistas' && !window._artistsLoaded) {
+        window._artistsLoaded = true;
+        loadStalenessStatus();
+        searchArtists(1);
     }
 }
 
@@ -545,7 +677,7 @@ async function loadCatalogMeta() {
 }
 
 function clearCatalogFilters() {
-    document.querySelectorAll('#tab-catalogo .filters input').forEach(i => i.value = '');
+    document.querySelectorAll('#tab-catalogo .filters input, #tab-catalogo .filters select').forEach(i => i.value = '');
     searchCatalog(1);
 }
 
@@ -556,7 +688,7 @@ document.querySelectorAll('#tab-catalogo th.sortable').forEach(th => {
             catalogSortDir = catalogSortDir === 'asc' ? 'desc' : 'asc';
         } else {
             catalogSortKey = key;
-            catalogSortDir = 'asc';
+            catalogSortDir = key === 'days_since' ? 'desc' : 'asc';
         }
         searchCatalog(1);
     });
@@ -584,6 +716,10 @@ async function searchCatalog(page) {
     if (label) params.set('label', label);
     if (yf) params.set('year_from', yf);
     if (yt) params.set('year_to', yt);
+    const never = document.getElementById('f_never').value;
+    const qbittorrent = document.getElementById('f_qbittorrent').value;
+    if (never) params.set('never_listened', never);
+    if (qbittorrent) params.set('qbittorrent', qbittorrent);
 
     const r = await fetch('/api/catalog/search?' + params.toString());
     const data = await r.json();
@@ -599,6 +735,8 @@ async function searchCatalog(page) {
             <td class="clickable" data-field="label">${escapeHtml(it.label || '')}</td>
             <td class="clickable" data-field="genre">${escapeHtml(it.genre || '')}</td>
             <td>${renderFirstListened(it)}</td>
+            <td>${formatDaysSince(it.days_since)}</td>
+            <td>${it.in_qbittorrent ? '<span class="icon-yes">✓</span>' : '<span class="icon-no">✗</span>'}</td>
         </tr>
     `).join('');
     document.querySelectorAll('#catalog-results tr').forEach((tr, i) => {
@@ -633,6 +771,79 @@ function renderFirstListened(it) {
         return `<span class="hint-approx" title="Ningún scrobble tiene el tag de álbum exacto (reediciones, recopilatorios...), pero la banda se escucha desde esta fecha">~ ${d}</span>`;
     }
     return '—';
+}
+
+// ── Escuchas y descargas (antes discos_olvidados) ───────────────────────
+
+function formatDaysSince(days) {
+    if (days === null || days === undefined) return '<span class="never">Nunca</span>';
+    const cls = days > 365 ? 'stale-high' : '';
+    if (days < 1) return '<span class="' + cls + '">hoy</span>';
+    if (days < 30) return `<span class="${cls}">${Math.round(days)} días</span>`;
+    if (days < 365) return `<span class="${cls}">${Math.round(days / 30)} meses</span>`;
+    return `<span class="${cls}">${(days / 365).toFixed(1)} años</span>`;
+}
+
+function setStalenessStatus(text) {
+    document.querySelectorAll('.staleness-status').forEach(el => el.textContent = text);
+}
+
+async function loadStalenessStatus() {
+    const data = await (await fetch('/api/catalog/staleness/status')).json();
+    setStalenessStatus(data.computed_at ? `Calculado: ${new Date(data.computed_at).toLocaleString('es-ES')}` : '');
+}
+
+async function refreshStaleness() {
+    setStalenessStatus('Recalculando (puede tardar unos segundos)…');
+    await fetch('/api/catalog/staleness/refresh', { method: 'POST' });
+    await loadStalenessStatus();
+    if (window._catalogLoaded) searchCatalog(catalogPage);
+    if (window._artistsLoaded) searchArtists(artistsPage);
+}
+
+let artistsPage = 1, artistsTotalPages = 1;
+let artistsSortKey = 'days_since', artistsSortDir = 'desc';
+
+function clearArtistFilters() {
+    document.getElementById('fr_artist').value = '';
+    document.getElementById('fr_never').value = '';
+    searchArtists(1);
+}
+
+document.querySelectorAll('#tab-artistas th.sortable').forEach(th => {
+    th.addEventListener('click', () => {
+        const key = th.dataset.sort;
+        if (artistsSortKey === key) artistsSortDir = artistsSortDir === 'asc' ? 'desc' : 'asc';
+        else { artistsSortKey = key; artistsSortDir = key === 'days_since' ? 'desc' : 'asc'; }
+        searchArtists(1);
+    });
+});
+
+async function searchArtists(page) {
+    artistsPage = page;
+    const params = new URLSearchParams({ page: page, sort: artistsSortKey, dir: artistsSortDir });
+    const artist = document.getElementById('fr_artist').value.trim();
+    const never = document.getElementById('fr_never').value;
+    if (artist) params.set('artist', artist);
+    if (never) params.set('never_listened', never);
+    const data = await (await fetch('/api/catalog/artists?' + params.toString())).json();
+    artistsTotalPages = Math.max(1, Math.ceil(data.total / data.per_page));
+    document.getElementById('summary-artists').textContent = `${data.total} artistas encontrados`;
+    document.getElementById('artists-results').innerHTML = data.items.map(it => `
+        <tr>
+            <td class="clickable" data-value="${escapeHtml(it.artist)}" title="Ver escuchas a lo largo del tiempo">${escapeHtml(it.artist)}</td>
+            <td>${it.album_count}</td>
+            <td>${it.backed_up_count} / ${it.album_count}</td>
+            <td>${formatDaysSince(it.days_since)}</td>
+        </tr>
+    `).join('');
+    document.querySelectorAll('#artists-results [data-value]').forEach(el => {
+        el.addEventListener('click', () => openArtistChart(el.dataset.value));
+    });
+    document.querySelectorAll('#tab-artistas th.sortable').forEach(th => {
+        th.querySelector('.sort-arrow').textContent = th.dataset.sort === artistsSortKey ? (artistsSortDir === 'asc' ? '▲' : '▼') : '';
+    });
+    renderPagination('artists-pagination', artistsPage, artistsTotalPages, searchArtists);
 }
 
 // ── Paginación (compartida) ─────────────────────────────────────────────

@@ -4,6 +4,7 @@ import sqlite3
 DB_PATH = os.environ.get("DB_PATH", "/app/discos_pendientes.db")
 MUSICA_LOCAL_DB = os.environ.get("MUSICA_LOCAL_DB", "/musica_local.sqlite")
 LASTFM_DB = os.environ.get("LASTFM_DB", "/data/lastfm_stats.db")
+TRASVASE_DB = os.environ.get("TRASVASE_DB", "/trasvase.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -122,5 +123,14 @@ def get_lastfm_conn() -> sqlite3.Connection:
     # Mismo volumen "lastfm_data" :ro que ya usa discos_olvidados/db.py --
     # immutable=1 por el mismo motivo de bind-mount de solo lectura.
     conn = sqlite3.connect(f"file:{LASTFM_DB}?mode=ro&immutable=1", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_trasvase_conn() -> sqlite3.Connection:
+    # music.db de services/trasvase -- albums.collection=2 es la carpeta
+    # de backup de qBittorrent/Lidarr, ya escaneada a diario por ese
+    # servicio (ver staleness._load_qbittorrent_index).
+    conn = sqlite3.connect(f"file:{TRASVASE_DB}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
     return conn

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, render_template_string
 
+import navidrome_client
 import staleness
 import sync
 from db import get_conn, get_lastfm_conn, get_musica_local_conn
@@ -447,6 +448,163 @@ def api_catalog_album(album_id):
     })
 
 
+# ── Biblioteca de Navidrome: Sin escuchas / Escuchados + playlists ───────
+
+LIBRARY_SORT_COLUMNS = {
+    "artist": "artist COLLATE NOCASE",
+    "album": "album COLLATE NOCASE",
+    "year": "year",
+    "genre": "genre COLLATE NOCASE",
+    "created": "created",
+    "tracks_heard": "tracks_heard",
+    "first_ts": "first_ts",
+    "last_ts": "last_ts",
+    "plays": "plays",
+}
+MAX_ALBUMS_PER_ADD = 200
+
+_library_sync_error = None
+
+
+def _sync_library_tracked():
+    global _library_sync_error
+    _library_sync_error = None
+    try:
+        sync.sync_library()
+    except Exception as e:
+        # Mensaje genérico salvo NavidromeError, que ya es seguro de mostrar.
+        _library_sync_error = str(e) if isinstance(e, navidrome_client.NavidromeError) else "Error inesperado al sincronizar (ver logs)"
+        app.logger.exception("sync_library")
+
+
+@app.route("/api/library")
+def api_library():
+    page = max(1, _int_or(request.args.get("page"), 1))
+    per_page = min(200, max(1, _int_or(request.args.get("per_page"), PER_PAGE)))
+    # Cualquier valor distinto de "yes" es la vista de sin escuchar.
+    where = ["match_kind IS NOT NULL" if request.args.get("listened") == "yes" else "match_kind IS NULL"]
+    params = []
+    for arg, column in (("artist", "artist"), ("album", "album"), ("genre", "genre")):
+        value = request.args.get(arg, "").strip()
+        if value:
+            where.append(f"{column} LIKE ?")
+            params.append(f"%{value}%")
+    for arg, op in (("year_from", ">="), ("year_to", "<=")):
+        year = _int_or(request.args.get(arg), None)
+        if year is not None:
+            where.append(f"year {op} ?")
+            params.append(year)
+    where_sql = "WHERE " + " AND ".join(where)
+    sort_col = LIBRARY_SORT_COLUMNS.get(request.args.get("sort"), LIBRARY_SORT_COLUMNS["artist"])
+    sort_dir = "DESC" if request.args.get("dir") == "desc" else "ASC"
+
+    conn = get_conn()
+    total = conn.execute(f"SELECT COUNT(*) FROM library_albums {where_sql}", params).fetchone()[0]
+    rows = conn.execute(
+        f"""
+        SELECT id, artist, album, year, genre, created, song_count, tracks_heard, match_kind, first_ts, last_ts, plays
+        FROM library_albums {where_sql}
+        ORDER BY {sort_col} {sort_dir}, artist COLLATE NOCASE, album COLLATE NOCASE
+        LIMIT ? OFFSET ?
+        """,
+        [*params, per_page, (page - 1) * per_page],
+    ).fetchall()
+    conn.close()
+    return jsonify({"total": total, "page": page, "per_page": per_page, "items": [dict(r) for r in rows]})
+
+
+@app.route("/api/library/status")
+def api_library_status():
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT MAX(synced_at) AS synced_at, COUNT(*) AS total, COUNT(match_kind) AS heard FROM library_albums"
+    ).fetchone()
+    conn.close()
+    return jsonify({
+        "configured": navidrome_client.is_configured(), "user": navidrome_client.username(),
+        "synced_at": row["synced_at"], "total": row["total"], "heard": row["heard"],
+        "running": _sync_lock.locked(), "error": _library_sync_error,
+    })
+
+
+@app.route("/api/library/sync", methods=["POST"])
+def api_library_sync():
+    if not navidrome_client.is_configured():
+        return jsonify({"started": False, "error": "Faltan NAVIDROME_USER / NAVIDROME_PASS en el .env"}), 503
+    return jsonify({"started": _run_sync_bg(_sync_library_tracked)})
+
+
+@app.route("/api/library/<album_id>/enrichment")
+def api_library_enrichment(album_id):
+    conn = get_conn()
+    row = conn.execute("SELECT artist, album FROM library_albums WHERE id = ?", (album_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "no encontrado"}), 404
+    try:
+        info = get_or_fetch_enrichment(conn, row["artist"], row["album"])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+    return jsonify(info)
+
+
+@app.route("/api/navidrome/playlists")
+def api_navidrome_playlists():
+    try:
+        return jsonify({"user": navidrome_client.username(), "items": navidrome_client.editable_playlists()})
+    except navidrome_client.NavidromeError as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/navidrome/playlist", methods=["POST"])
+def api_navidrome_add_to_playlist():
+    """Añade álbumes enteros, en orden, a una playlist existente
+    (playlist_id) o nueva (name). No repite canciones que ya estén, así que
+    reintentar es seguro."""
+    data = request.get_json(silent=True) or {}
+    album_ids = data.get("album_ids")
+    playlist_id = (data.get("playlist_id") or "").strip()
+    name = (data.get("name") or "").strip()
+    if not isinstance(album_ids, list) or not album_ids or not all(isinstance(a, str) for a in album_ids):
+        return jsonify({"error": "No hay álbumes seleccionados"}), 400
+    if len(album_ids) > MAX_ALBUMS_PER_ADD:
+        return jsonify({"error": f"Máximo {MAX_ALBUMS_PER_ADD} álbumes de una vez"}), 400
+    if bool(playlist_id) == bool(name):
+        return jsonify({"error": "Elige una playlist o escribe el nombre de una nueva"}), 400
+
+    try:
+        existing = navidrome_client.playlist_info(playlist_id) if playlist_id else {"name": name, "song_ids": []}
+        seen = set(existing["song_ids"])
+        to_add, failed = [], []
+        for album_id in dict.fromkeys(album_ids):
+            try:
+                song_ids = navidrome_client.album_song_ids(album_id)
+            except navidrome_client.NavidromeError:
+                failed.append(album_id)  # ej. borrado de Navidrome desde el último sync
+                continue
+            for song_id in song_ids:
+                if song_id not in seen:
+                    seen.add(song_id)
+                    to_add.append(song_id)
+
+        if len(failed) == len(set(album_ids)):
+            return jsonify({"error": "No se pudo leer ninguno de los álbumes en Navidrome"}), 502
+        if playlist_id:
+            if to_add:
+                navidrome_client.add_to_playlist(playlist_id, to_add)
+        else:
+            playlist_id = navidrome_client.create_playlist(name, to_add)
+    except navidrome_client.NavidromeError as e:
+        return jsonify({"error": str(e)}), 502
+
+    return jsonify({
+        "playlist_id": playlist_id, "name": existing["name"], "added": len(to_add),
+        "failed_albums": failed,
+    })
+
+
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="es">
@@ -525,6 +683,18 @@ tr:hover td { background: var(--surface-2); }
 .stale-high { color: var(--warning); }
 .staleness-status { color: var(--text-muted); font-size: 12px; align-self: center; }
 .hint-approx { color: var(--text-muted); border-bottom: 1px dashed var(--text-muted); cursor: help; }
+.library-summary { color: var(--text-muted); font-size: 13px; margin-bottom: 10px; }
+.library-notice { color: var(--warning); font-size: 13px; margin-bottom: 10px; }
+.check-cell { width: 34px; text-align: center; }
+.check-cell input { cursor: pointer; width: 15px; height: 15px; accent-color: var(--accent); }
+body.has-playlist-bar { padding-bottom: 90px; }
+#playlist-bar { display: none; position: fixed; left: 0; right: 0; bottom: 0; z-index: 100; background: var(--surface); border-top: 1px solid var(--accent); padding: 12px 20px; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+#playlist-bar.visible { display: flex; }
+#playlist-bar select, #playlist-bar input { padding: 6px 8px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 13px; }
+#pl_name { min-width: 260px; }
+#pl_count { color: #fff; font-weight: 600; }
+#pl_status { color: var(--text-muted); }
+#pl_status.error { color: var(--danger); }
 </style>
 </head>
 <body>
@@ -533,6 +703,8 @@ tr:hover td { background: var(--surface-2); }
     <button class="tab-btn active" data-tab="pendientes" onclick="switchTab('pendientes')">Pendientes</button>
     <button class="tab-btn" data-tab="catalogo" onclick="switchTab('catalogo')">Catálogo</button>
     <button class="tab-btn" data-tab="artistas" onclick="switchTab('artistas')">Artistas</button>
+    <button class="tab-btn" data-tab="sin-escuchas" onclick="switchTab('sin-escuchas')">Sin escuchas</button>
+    <button class="tab-btn" data-tab="escuchados" onclick="switchTab('escuchados')">Escuchados</button>
 </div>
 
 <div id="tab-pendientes" class="tab-panel active">
@@ -630,6 +802,18 @@ tr:hover td { background: var(--surface-2); }
     <div class="pagination" id="artists-pagination"></div>
 </div>
 
+<div id="tab-sin-escuchas" class="tab-panel"></div>
+<div id="tab-escuchados" class="tab-panel"></div>
+
+<div id="playlist-bar">
+    <span id="pl_count"></span>
+    <select id="pl_target" onchange="updatePlaylistBar()"></select>
+    <input type="text" id="pl_name" placeholder="Nombre de la nueva playlist" maxlength="200">
+    <button id="pl_add" onclick="addSelectionToPlaylist()">Añadir a playlist</button>
+    <button class="secondary" onclick="clearSelection()">Vaciar selección</button>
+    <span id="pl_status"></span>
+</div>
+
 <div id="panel">
     <button id="panel-close" onclick="closePanel()">×</button>
     <div id="panel-body"></div>
@@ -660,6 +844,11 @@ function switchTab(tab) {
         loadStalenessStatus();
         searchArtists(1);
     }
+    if (LIBRARY_VIEWS[tab] && !LIBRARY_VIEWS[tab].loaded) {
+        LIBRARY_VIEWS[tab].loaded = true;
+        LIBRARY_VIEWS[tab].search(1);
+    }
+    updatePlaylistBar();
 }
 
 // ── Pendientes ──────────────────────────────────────────────────────────
@@ -911,6 +1100,299 @@ async function searchArtists(page) {
     });
     renderPagination('artists-pagination', artistsPage, artistsTotalPages, searchArtists);
 }
+
+// ── Biblioteca de Navidrome: Sin escuchas / Escuchados ──────────────────
+
+function formatTs(ts) {
+    return ts ? new Date(ts * 1000).toLocaleDateString('es-ES') : '—';
+}
+
+function renderListenDate(it, ts) {
+    if (it.match_kind !== 'tracks') return formatTs(ts);
+    return `<span class="hint-approx" title="Ningún scrobble lleva el tag de este álbum, pero ${it.tracks_heard} de sus ${it.song_count} pistas sí tienen escuchas (reediciones, etc.)">~ ${formatTs(ts)}</span>`;
+}
+
+const LIBRARY_VIEWS = {
+    'sin-escuchas': {
+        listened: 'no', sortKey: 'created', sortDir: 'desc', page: 1, items: [], loaded: false,
+        search: searchSinEscuchas,
+        noun: 'álbumes sin escuchar',
+        columns: [
+            { key: 'created', label: 'Añadido', render: it => it.created ? new Date(it.created).toLocaleDateString('es-ES') : '—' },
+            { key: 'tracks_heard', label: 'Pistas sueltas', title: 'Pistas de este álbum con scrobbles, sin llegar a contar como escuchado (menos de la mitad y ningún scrobble con el tag del álbum)',
+              render: it => it.tracks_heard ? `${it.tracks_heard} / ${it.song_count}` : '—' },
+        ],
+    },
+    'escuchados': {
+        listened: 'yes', sortKey: 'last_ts', sortDir: 'desc', page: 1, items: [], loaded: false,
+        search: searchEscuchados,
+        noun: 'álbumes escuchados',
+        columns: [
+            { key: 'first_ts', label: 'Primera escucha', title: 'Last.fm + ListenBrainz', render: it => renderListenDate(it, it.first_ts) },
+            { key: 'last_ts', label: 'Última escucha', title: 'Last.fm + ListenBrainz', render: it => renderListenDate(it, it.last_ts) },
+            { key: 'plays', label: 'Scrobbles', render: it => it.plays.toLocaleString('es-ES') },
+        ],
+    },
+};
+
+const LIBRARY_BASE_COLUMNS = [
+    { key: 'artist', label: 'Artista' }, { key: 'album', label: 'Álbum' },
+    { key: 'year', label: 'Año' }, { key: 'genre', label: 'Género' },
+];
+const LIBRARY_ASC_FIRST = new Set(['artist', 'album', 'genre']);
+
+// Nombres globales: renderPagination() los invoca por fn.name.
+function searchSinEscuchas(page) { return searchLibrary('sin-escuchas', page); }
+function searchEscuchados(page) { return searchLibrary('escuchados', page); }
+
+function libraryEl(mode, suffix) {
+    return document.getElementById(`lib-${mode}-${suffix}`);
+}
+
+function buildLibraryPanel(mode) {
+    const view = LIBRARY_VIEWS[mode];
+    const th = c => `<th class="sortable" data-sort="${c.key}"${c.title ? ` title="${escapeAttr(c.title)}"` : ''}>${c.label}<span class="sort-arrow"></span></th>`;
+    const field = (name, label, attrs) => `<div><label>${label}</label><input id="lib-${mode}-${name}" ${attrs || 'type="text"'}></div>`;
+    const panel = document.getElementById('tab-' + mode);
+    panel.innerHTML = `
+        <div class="filters">
+            ${field('artist', 'Artista')}${field('album', 'Álbum')}${field('genre', 'Género')}
+            ${field('year_from', 'Año desde', 'type="number" placeholder="1990"')}
+            ${field('year_to', 'Año hasta', 'type="number" placeholder="2026"')}
+            <div class="actions">
+                <button data-action="search">Buscar</button>
+                <button class="secondary" data-action="clear">Limpiar</button>
+                <button class="secondary" data-action="sync" title="Vuelve a leer la biblioteca de Navidrome y a cruzarla con Last.fm + ListenBrainz">Actualizar desde Navidrome</button>
+                <span class="staleness-status library-status"></span>
+            </div>
+        </div>
+        <div class="library-notice" id="lib-${mode}-notice" hidden></div>
+        <div class="library-summary" id="lib-${mode}-summary"></div>
+        <table>
+            <thead><tr>
+                <th class="check-cell"><input type="checkbox" id="lib-${mode}-all" title="Seleccionar esta página"></th>
+                ${LIBRARY_BASE_COLUMNS.concat(view.columns).map(th).join('')}
+            </tr></thead>
+            <tbody id="lib-${mode}-results"></tbody>
+        </table>
+        <div class="pagination" id="lib-${mode}-pagination"></div>
+    `;
+    panel.querySelector('[data-action=search]').addEventListener('click', () => view.search(1));
+    panel.querySelector('[data-action=sync]').addEventListener('click', syncLibrary);
+    panel.querySelector('[data-action=clear]').addEventListener('click', () => {
+        panel.querySelectorAll('.filters input').forEach(i => i.value = '');
+        view.search(1);
+    });
+    panel.querySelectorAll('.filters input').forEach(i => i.addEventListener('keydown', e => {
+        if (e.key === 'Enter') view.search(1);
+    }));
+    panel.querySelectorAll('th.sortable').forEach(el => el.addEventListener('click', () => {
+        const key = el.dataset.sort;
+        if (view.sortKey === key) view.sortDir = view.sortDir === 'asc' ? 'desc' : 'asc';
+        else { view.sortKey = key; view.sortDir = LIBRARY_ASC_FIRST.has(key) ? 'asc' : 'desc'; }
+        view.search(1);
+    }));
+    libraryEl(mode, 'all').addEventListener('change', e => {
+        view.items.forEach(it => setSelected(it, e.target.checked));
+        renderLibrarySelection();
+    });
+}
+
+async function searchLibrary(mode, page) {
+    const view = LIBRARY_VIEWS[mode];
+    view.page = page;
+    const params = new URLSearchParams({ listened: view.listened, page: page, sort: view.sortKey, dir: view.sortDir });
+    ['artist', 'album', 'genre', 'year_from', 'year_to'].forEach(name => {
+        const value = libraryEl(mode, name).value.trim();
+        if (value) params.set(name, value);
+    });
+    const [data] = await Promise.all([
+        fetch('/api/library?' + params.toString()).then(r => r.json()),
+        loadLibraryStatus(),
+    ]);
+    view.items = data.items;
+
+    libraryEl(mode, 'summary').textContent = `${data.total} ${view.noun}`;
+    libraryEl(mode, 'results').innerHTML = data.items.map((it, i) => `
+        <tr class="row-link" data-idx="${i}">
+            <td class="check-cell"><input type="checkbox" data-idx="${i}"></td>
+            <td class="clickable" data-field="artist" title="Ver escuchas a lo largo del tiempo">${escapeHtml(it.artist)}</td>
+            <td data-owned-artist="${escapeAttr(it.artist)}" data-owned-album="${escapeAttr(it.album)}">${escapeHtml(it.album)}</td>
+            <td>${it.year || ''}</td>
+            <td>${escapeHtml(it.genre || '')}</td>
+            ${view.columns.map(c => `<td>${c.render(it)}</td>`).join('')}
+        </tr>
+    `).join('');
+    libraryEl(mode, 'results').querySelectorAll('tr').forEach(tr => {
+        const item = view.items[parseInt(tr.dataset.idx)];
+        tr.addEventListener('click', evt => {
+            if (evt.target.closest('.check-cell')) return;
+            if (evt.target.dataset.field === 'artist') openArtistChart(item.artist);
+            else openLibraryPanel(item);
+        });
+        tr.querySelector('input').addEventListener('change', e => {
+            setSelected(item, e.target.checked);
+            renderLibrarySelection();
+        });
+    });
+
+    document.querySelectorAll(`#tab-${mode} th.sortable`).forEach(th => {
+        th.querySelector('.sort-arrow').textContent = th.dataset.sort === view.sortKey ? (view.sortDir === 'asc' ? '▲' : '▼') : '';
+    });
+    renderPagination(`lib-${mode}-pagination`, page, Math.max(1, Math.ceil(data.total / data.per_page)), view.search);
+    renderLibrarySelection();
+}
+
+function openLibraryPanel(item) {
+    const body = document.getElementById('panel-body');
+    body.innerHTML = `
+        <div class="panel-title">${escapeHtml(item.album)}</div>
+        <div class="panel-sub">${escapeHtml(item.artist)}</div>
+        <span class="owned-badge">En Navidrome</span>
+        <div id="panel-extra"><div class="panel-empty" style="margin-top:16px">Cargando…</div></div>
+    `;
+    document.getElementById('panel').classList.add('open');
+    fetch(`/api/library/${encodeURIComponent(item.id)}/enrichment`)
+        .then(r => r.json())
+        .then(info => { document.getElementById('panel-extra').innerHTML = renderPanelExtra(info); })
+        .catch(() => { document.getElementById('panel-extra').innerHTML = '<div class="panel-empty">No se pudo cargar la info.</div>'; });
+}
+
+async function loadLibraryStatus() {
+    const st = await (await fetch('/api/library/status')).json();
+    let text = '', notice = '';
+    if (st.running) text = 'Sincronizando…';
+    else if (st.synced_at) text = `Sincronizado: ${new Date(st.synced_at).toLocaleString('es-ES')} (usuario ${st.user})`;
+    if (!st.configured) notice = 'Faltan NAVIDROME_USER y NAVIDROME_PASS en el .env del servicio.';
+    else if (st.error) notice = 'Última sincronización fallida: ' + st.error;
+    else if (!st.synced_at && !st.running) notice = 'Aún no se ha leído la biblioteca: pulsa «Actualizar desde Navidrome».';
+    document.querySelectorAll('.library-status').forEach(el => el.textContent = text);
+    Object.keys(LIBRARY_VIEWS).forEach(mode => {
+        const el = libraryEl(mode, 'notice');
+        el.textContent = notice;
+        el.hidden = !notice;
+    });
+    return st;
+}
+
+async function syncLibrary() {
+    const r = await fetch('/api/library/sync', { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) { await loadLibraryStatus(); return; }
+    if (!data.started) {
+        document.querySelectorAll('.library-status').forEach(el => el.textContent = 'Ya hay una sincronización en curso; prueba en un momento.');
+        return;
+    }
+    while ((await loadLibraryStatus()).running) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+    Object.values(LIBRARY_VIEWS).forEach(v => { if (v.loaded) v.search(v.page); });
+}
+
+// ── Selección y playlists ───────────────────────────────────────────────
+// La selección sobrevive a la paginación y al cambio de pestaña.
+
+const selectedAlbums = new Map();
+let playlistsLoaded = false;
+
+function setSelected(item, on) {
+    if (on) selectedAlbums.set(item.id, item);
+    else selectedAlbums.delete(item.id);
+}
+
+function clearSelection() {
+    selectedAlbums.clear();
+    setPlaylistStatus('');
+    renderLibrarySelection();
+}
+
+function setPlaylistStatus(text, isError) {
+    const el = document.getElementById('pl_status');
+    el.textContent = text;
+    el.classList.toggle('error', !!isError);
+}
+
+function renderLibrarySelection() {
+    Object.entries(LIBRARY_VIEWS).forEach(([mode, view]) => {
+        if (!view.loaded) return;
+        libraryEl(mode, 'results').querySelectorAll('input[type=checkbox]').forEach(cb => {
+            cb.checked = selectedAlbums.has(view.items[parseInt(cb.dataset.idx)].id);
+        });
+        const all = libraryEl(mode, 'all');
+        const selectedHere = view.items.filter(it => selectedAlbums.has(it.id)).length;
+        all.checked = view.items.length > 0 && selectedHere === view.items.length;
+        all.indeterminate = selectedHere > 0 && !all.checked;
+    });
+    updatePlaylistBar();
+}
+
+function updatePlaylistBar() {
+    const activeTab = document.querySelector('.tab-btn.active').dataset.tab;
+    const n = selectedAlbums.size;
+    const visible = n > 0 && !!LIBRARY_VIEWS[activeTab];
+    document.getElementById('playlist-bar').classList.toggle('visible', visible);
+    document.body.classList.toggle('has-playlist-bar', visible);
+    document.getElementById('pl_count').textContent = `${n} ${n === 1 ? 'álbum' : 'álbumes'}`;
+    document.getElementById('pl_name').hidden = document.getElementById('pl_target').value !== '';
+    if (visible && !playlistsLoaded) { playlistsLoaded = true; loadPlaylists(); }
+}
+
+async function loadPlaylists() {
+    const select = document.getElementById('pl_target');
+    const current = select.value;
+    let items = [];
+    try {
+        const r = await fetch('/api/navidrome/playlists');
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error);
+        items = data.items;
+    } catch (e) {
+        playlistsLoaded = false;  // reintenta en la próxima selección
+        setPlaylistStatus('No se pudieron cargar las playlists: ' + e.message, true);
+    }
+    select.innerHTML = '<option value="">Nueva playlist…</option>' + items.map(p =>
+        `<option value="${escapeAttr(p.id)}">${escapeHtml(p.name)} (${p.song_count})</option>`).join('');
+    select.value = items.some(p => p.id === current) ? current : '';
+    updatePlaylistBar();
+}
+
+async function addSelectionToPlaylist() {
+    const playlistId = document.getElementById('pl_target').value;
+    const name = document.getElementById('pl_name').value.trim();
+    if (!playlistId && !name) { setPlaylistStatus('Escribe el nombre de la nueva playlist.', true); return; }
+    const button = document.getElementById('pl_add');
+    button.disabled = true;
+    setPlaylistStatus('Añadiendo…');
+    try {
+        const r = await fetch('/api/navidrome/playlist', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ album_ids: [...selectedAlbums.keys()], playlist_id: playlistId, name: playlistId ? '' : name }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error);
+        const failed = data.failed_albums.map(id => selectedAlbums.get(id));
+        selectedAlbums.clear();
+        failed.forEach(it => selectedAlbums.set(it.id, it));  // los fallidos quedan para reintentar
+        document.getElementById('pl_name').value = '';
+        await loadPlaylists();
+        document.getElementById('pl_target').value = data.playlist_id;
+        renderLibrarySelection();
+        const msg = `${data.added} canciones añadidas a «${data.name}»`;
+        if (failed.length) {
+            setPlaylistStatus(`${msg}. Fallaron ${failed.length} álbumes (siguen seleccionados).`, true);
+        } else {
+            alert(msg);
+            setPlaylistStatus('');
+        }
+    } catch (e) {
+        setPlaylistStatus(e.message, true);
+    } finally {
+        button.disabled = false;
+    }
+}
+
+Object.keys(LIBRARY_VIEWS).forEach(buildLibraryPanel);
 
 // ── Paginación (compartida) ─────────────────────────────────────────────
 

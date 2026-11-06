@@ -79,6 +79,26 @@ CREATE TABLE IF NOT EXISTS artist_first_listen (
     first_ts    INTEGER,
     synced_at   TEXT NOT NULL
 );
+
+-- Biblioteca de Navidrome del usuario NAVIDROME_USER cruzada con los
+-- scrobbles (pestañas Sin escuchas / Escuchados). Se reemplaza entera en
+-- cada sync (ver sync.sync_library). match_kind NULL = no escuchado.
+CREATE TABLE IF NOT EXISTS library_albums (
+    id           TEXT PRIMARY KEY,
+    artist       TEXT NOT NULL,
+    album        TEXT NOT NULL,
+    year         INTEGER,
+    genre        TEXT,
+    created      TEXT,
+    song_count   INTEGER NOT NULL DEFAULT 0,
+    tracks_heard INTEGER NOT NULL DEFAULT 0,
+    match_kind   TEXT,
+    first_ts     INTEGER,
+    last_ts      INTEGER,
+    plays        INTEGER NOT NULL DEFAULT 0,
+    synced_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_library_albums_match ON library_albums(match_kind);
 """
 
 

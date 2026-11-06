@@ -6,7 +6,8 @@ están en la biblioteca local. También recorre el calendario de
 lanzamientos ("discos", ver radicale_writer.py) marcando en Radicale
 (icono + fecha) lo que ya esté descargado, esté o no en la lista de
 pendientes. Y cruza el catálogo local con los scrobbles de Last.fm para
-cachear la "primera escucha" de cada álbum (ver listens.py).
+cachear la "primera escucha" de cada álbum (ver listens.py). Y lo mismo
+con la biblioteca de Navidrome para las pestañas Sin escuchas/Escuchados.
 
 Uso:
     python3 sync.py --all               # backfill completo (ignora el caché de edad)
@@ -17,12 +18,13 @@ Uso:
 import argparse
 from datetime import datetime, timedelta, timezone
 
+import navidrome_client
 import radicale_client
 import radicale_writer
 from airsonic_client import search_airsonic
 from db import get_conn, get_lastfm_conn, get_musica_local_conn
 from enrich import get_or_fetch_enrichment
-from listens import compute_album_first_listens, compute_artist_first_listens
+from listens import compute_album_first_listens, compute_artist_first_listens, compute_library_rows, load_listen_index
 from qbittorrent_client import get_torrents, search_qbittorrent
 
 STALE_HOURS = 24
@@ -205,6 +207,53 @@ def sync_artist_first_listens() -> int:
     return len(rows)
 
 
+def sync_library() -> int:
+    """Reemplaza library_albums con lo que ve NAVIDROME_USER cruzado con
+    los scrobbles. Lanza NavidromeError si Navidrome falla: todo se lee
+    antes de abrir la transacción, así un fallo conserva los datos previos
+    en vez de vaciar las pestañas."""
+    albums = navidrome_client.fetch_albums()
+    songs = navidrome_client.fetch_songs()
+    if not albums:
+        raise navidrome_client.NavidromeError("Navidrome no ha devuelto ningún álbum; se conservan los datos anteriores")
+
+    lastfm_conn = get_lastfm_conn()
+    try:
+        rows = compute_library_rows(albums, songs, load_listen_index(lastfm_conn))
+    finally:
+        lastfm_conn.close()
+
+    now = _now()
+    conn = get_conn()
+    with conn:
+        conn.execute("DELETE FROM library_albums")
+        conn.executemany(
+            """
+            INSERT INTO library_albums (id, artist, album, year, genre, created, song_count, tracks_heard,
+                                        match_kind, first_ts, last_ts, plays, synced_at)
+            VALUES (:id, :artist, :album, :year, :genre, :created, :song_count, :tracks_heard,
+                    :match_kind, :first_ts, :last_ts, :plays, :synced_at)
+            """,
+            [{**r, "synced_at": now} for r in rows],
+        )
+    conn.close()
+    heard = sum(1 for r in rows if r["match_kind"])
+    print(f"library: {len(rows)} álbumes, {heard} escuchados, {len(rows) - heard} sin escuchas")
+    return len(rows)
+
+
+def _sync_library_safe() -> None:
+    """Para la pasada de cron: sin credenciales o con Navidrome caído no
+    debe tumbar el resto del sync."""
+    if not navidrome_client.is_configured():
+        print("library: omitido, faltan NAVIDROME_USER / NAVIDROME_PASS")
+        return
+    try:
+        sync_library()
+    except navidrome_client.NavidromeError as e:
+        print(f"library: aviso, no se pudo sincronizar ({e})")
+
+
 def sync_all() -> None:
     sync_tasks()
     sync_downloaded_status(stale_only=False)
@@ -212,6 +261,7 @@ def sync_all() -> None:
     sync_release_calendar(stale_only=False)
     sync_album_first_listens()
     sync_artist_first_listens()
+    _sync_library_safe()
     print("Hecho.")
 
 
@@ -326,3 +376,4 @@ if __name__ == "__main__":
         sync_release_calendar(stale_only=True)
         sync_album_first_listens()
         sync_artist_first_listens()
+        _sync_library_safe()

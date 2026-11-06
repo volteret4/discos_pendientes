@@ -60,6 +60,8 @@
 - `server.py` — Flask, una plantilla HTML con dos pestañas (Pendientes /
   Catálogo) y panel lateral flotante compartido, mismo patrón visual que
   el resto de servicios del monorepo.
+- `navidrome_client.py` — Subsonic de Navidrome con `NAVIDROME_USER`:
+  biblioteca y playlists (ver "Pestañas Sin escuchas / Escuchados").
 - `listens.py` — cruza `musica_local.sqlite` con los scrobbles de
   Last.fm (`lastfm_stats.db`, esquema `artists`/`albums`/`scrobbles` ya
   documentado en `services/discos_olvidados/staleness.py`) para sacar,
@@ -124,6 +126,40 @@ Requiere montar el volumen `lastfm_data:ro` (el mismo que ya usan
 `discos_olvidados`/`lastfm_explorer`) con `LASTFM_DB=/data/lastfm_stats.db`
 -- ver `docker-compose.yml` del monorepo (`tumtumpa`), servicio
 `discos-pendientes`.
+
+## Pestañas Sin escuchas / Escuchados y playlists (Navidrome)
+
+Biblioteca de **`NAVIDROME_USER`** cruzada con todos los scrobbles
+(`lastfm_stats.db` ya une Last.fm y ListenBrainz). `sync.sync_library()` la
+vuelca entera en `library_albums` (cron diario o botón "Actualizar desde
+Navidrome"); si Navidrome falla se conservan los datos anteriores.
+
+**Por qué un usuario propio y no `AIRSONIC_USER`**: en producción ese es
+`admin`, que ve también la biblioteca `mixxx` (5.869 álbumes frente a los
+4.185 de `music`, que solo tiene `music` y `temp`), y además una playlist
+pertenece a quien la crea.
+
+**Cuándo un álbum cuenta como escuchado** (`listens.match_album`):
+
+- `match_kind='album'`: scrobbles con su tag de álbum, mirando también el
+  artista de cada canción (en un "Various Artists" el scrobble va a nombre
+  del artista de la pista).
+- `match_kind='tracks'`: sin tag, pero al menos `LISTENED_TRACK_RATIO` (50%)
+  de sus pistas tienen scrobbles. Recupera reediciones ("Bad Moon Rising",
+  11/12) sin dar por oído un disco por una pista suelta ("MCMXC a.D.", 1/7,
+  que se queda en Sin escuchas con "1 / 7" en Pistas sueltas). La UI lo marca
+  con "~" porque una pista pudo sonar desde otro disco.
+
+Sigue siendo igualdad exacta tras `listen_key()`, no fuzzy matching (ver el
+falso negativo del ~42% más arriba). Un álbum sin ninguna coincidencia aún
+puede ser falso negativo si el título de la pista difiere.
+
+**Playlists**: añade álbumes enteros en orden, sin repetir canciones ya
+presentes, así que reintentar es seguro. Solo se ofrecen las playlists del
+propio usuario, porque Subsonic no deja modificar las ajenas.
+
+`navidrome_client.py` va siempre por POST con token+salt: las credenciales no
+aparecen en URLs y los errores no arrastran la petición.
 
 ## Por qué nunca se toca STATUS de VTODO
 

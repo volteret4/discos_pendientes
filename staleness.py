@@ -72,7 +72,7 @@ def _load_lastfm_album_last_ts() -> dict:
 def _load_qbittorrent_index() -> set:
     """{(normalize(artist), normalize(album))} -- álbumes presentes en el
     backup de qBittorrent/Lidarr (services/trasvase music.db,
-    collection=2 = /ruta/al/nas/lidarr/torrents_backup en pepecono)."""
+    collection=2 = la carpeta de descargas de qBittorrent`)."""
     conn = get_trasvase_conn()
     try:
         return {

@@ -227,11 +227,11 @@ normal, así que no hace falta correrlo a mano salvo la primera vez
 Bajo el mismo `RADICALE_URL`, tres calendarios **hermanos** (no uno
 anidado en el otro) que es fácil confundir por nombre parecido:
 
-| Variable                | Displayname en Radicale | UID (pepecono)                        | Uso aquí |
+| Variable                | Displayname en Radicale | UID                                   | Uso aquí |
 |--------------------------|--------------------------|-----------------------------------------|----------|
-| `RELEASE_CALENDAR_NAME`  | **discos**               | `d1573ec1-e837-6918-1dfe-bc0b6c04681d` | VEVENT de lanzamientos — el que lleva el icono 💿/📀/🎵→💾. El mismo que `dieta_sonora` conoce como `CALENDAR_NAME`. |
-| `CALENDAR_TASKS`         | discos_pendientes        | `00169e81-e5f4-d26a-d1c9-23a3dad5ea5b` | VTODO de la lista de pendientes — el que sí se usa para `tasks`/`pending_status`. |
-| *(no usado aquí)*        | Discos descargados       | `982339b6-2686-86aa-068c-d6dcdb8f712c` | Calendario **distinto**, usado por otra parte de `dieta_sonora` — **no** confundir con "discos". Es la fuente de la colisión de nombre de variable "CALENDAR_NAME" en el `.env` raíz (ver arriba). |
+| `RELEASE_CALENDAR_NAME`  | **discos**               | `<uid de tu calendario>` | VEVENT de lanzamientos — el que lleva el icono 💿/📀/🎵→💾. El mismo que `dieta_sonora` conoce como `CALENDAR_NAME`. |
+| `CALENDAR_TASKS`         | discos_pendientes        | `<uid de tu calendario>` | VTODO de la lista de pendientes — el que sí se usa para `tasks`/`pending_status`. |
+| *(no usado aquí)*        | Discos descargados       | `<uid de tu calendario>` | Calendario **distinto**, usado por otra parte de `dieta_sonora` — **no** confundir con "discos". Es la fuente de la colisión de nombre de variable "CALENDAR_NAME" en el `.env` raíz (ver arriba). |
 
 Si en el futuro algo deja de funcionar y "el icono no cambia" o "cambia
 en el calendario equivocado", lo primero es verificar con un `PROPFIND`

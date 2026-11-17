@@ -3,3 +3,4 @@ __pycache__/
 discos_pendientes.db
 .env
 .venv*/
+datos/
